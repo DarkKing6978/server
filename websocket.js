@@ -525,6 +525,7 @@ const handlers = {
     ws._participantId = participantId;
     if (participantId) {
       participantSockets.set(`${sessionId}:${participantId}`, ws);
+      broadcastEvent(sessionId, 'participant.joined', { participantId, participantName });
     }
     sendTo(ws, 'subscribed', { sessionId, participantId }, cid);
   },
@@ -567,7 +568,7 @@ wss.on('connection', (ws, req) => {
       }
     } catch (e) {
       console.error(`[WS] Error:`, e.message);
-      sendTo(ws, 'error', { message: e.message });
+      sendTo(ws, 'error', { message: e.message }, msg?.cid);
     }
   });
 
