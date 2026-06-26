@@ -1,0 +1,18 @@
+{
+  "name": "slidemath-ws",
+  "version": "2.0.0",
+  "description": "SlideMath WebSocket Server — real-time test sync with direct MySQL",
+  "main": "websocket.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node websocket.js",
+    "dev": "node --watch websocket.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "mysql2": "^3.11.0",
+    "dotenv": "^16.4.0"
+  }
+}
