@@ -7,6 +7,7 @@ require('dotenv').config({ __dirname: require('path').join(__dirname, '.env') })
 
 const WebSocket = require('ws');
 const http = require('http');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || process.env.WS_PORT || 8080;
 const API_BASE_URL = process.env.API_BASE_URL || '';
@@ -14,7 +15,24 @@ const SERVER_API_KEY = process.env.SERVER_API_KEY || '';
 
 // ── HTTP API helper ──────────────────────────────────────────────────────────
 // Cookie jar for anti-hotlink protection (InfinityFree returns HTML on first request)
-const _cookieJar = new Map(); // domain → cookie string
+const _cookieJar = new Map(); // name → value
+
+function _solveAntiHotlink(html) {
+  const m = html.match(/var a=toNumbers\("([0-9a-f]+)"\),b=toNumbers\("([0-9a-f]+)"\),c=toNumbers\("([0-9a-f]+)"\)/);
+  if (!m) return null;
+  try {
+    const key = Buffer.from(m[1], 'hex');
+    const iv = Buffer.from(m[2], 'hex');
+    const ciphertext = Buffer.from(m[3], 'hex');
+    const decipher = crypto.createDecipheriv('aes-128-cbc', key, iv);
+    decipher.setAutoPadding(false);
+    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return decrypted.toString('hex');
+  } catch (e) {
+    console.error('[API] AES decrypt error:', e.message);
+    return null;
+  }
+}
 
 function _extractCookie(response) {
   const headers = response.headers;
@@ -23,9 +41,7 @@ function _extractCookie(response) {
     const parts = raw.split(';')[0].trim();
     const eqIdx = parts.indexOf('=');
     if (eqIdx > 0) {
-      const name = parts.substring(0, eqIdx).trim();
-      const value = parts.substring(eqIdx + 1).trim();
-      _cookieJar.set(name, value);
+      _cookieJar.set(parts.substring(0, eqIdx).trim(), parts.substring(eqIdx + 1).trim());
     }
   }
 }
@@ -58,31 +74,27 @@ async function apiCall(endpoint, method = 'GET', body = null, retries = 3) {
 
       const text = await res.text();
 
-      // Handle anti-hotlink HTML responses
+      // Check if response is HTML (anti-hotlink or error page)
       if (text.trim().startsWith('<!') || text.trim().startsWith('<html')) {
-        // Try to extract cookie from document.cookie in the HTML
-        const match = text.match(/document\.cookie\s*=\s*["']([^"']+)["']/);
-        if (match) {
-          const parts = match[1].split(';')[0].trim();
-          const eqIdx = parts.indexOf('=');
-          if (eqIdx > 0) {
-            _cookieJar.set(parts.substring(0, eqIdx).trim(), parts.substring(eqIdx + 1).trim());
-            console.log(`[API] Extracted anti-hotlink cookie from HTML`);
-          }
+        // Try AES decrypt for InfinityFree anti-hotlink
+        const cookieValue = _solveAntiHotlink(text);
+        if (cookieValue) {
+          _cookieJar.set('__test', cookieValue);
+          console.log(`[API] Solved anti-hotlink cookie: __test=${cookieValue.substring(0, 8)}...`);
         }
         if (attempt < retries) {
-          console.log(`[API] Got HTML response (attempt ${attempt + 1}/${retries + 1}), retrying...`);
-          await sleep(500 * (attempt + 1));
+          console.log(`[API] Got HTML from ${endpoint} (attempt ${attempt + 1}/${retries + 1}), retrying...`);
+          await sleep(300 * (attempt + 1));
           continue;
         }
-        throw new Error(`Got HTML instead of JSON from ${endpoint} (anti-hotlink)`);
+        throw new Error(`Got HTML instead of JSON from ${endpoint}`);
       }
 
       const json = JSON.parse(text);
       return json;
     } catch (e) {
       if (attempt < retries) {
-        await sleep(500 * (attempt + 1));
+        await sleep(300 * (attempt + 1));
         continue;
       }
       throw e;
