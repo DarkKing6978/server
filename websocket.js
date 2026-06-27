@@ -563,8 +563,10 @@ function handleConnection(ws, req) {
   sendTo(ws, 'connected', { sessionId });
 
   ws.on('message', async (raw) => {
+    let cid;
     try {
       const msg = JSON.parse(raw.toString());
+      cid = msg.cid;
       const handler = handlers[msg.type];
       if (handler) {
         await handler(ws, msg);
@@ -573,7 +575,7 @@ function handleConnection(ws, req) {
       }
     } catch (e) {
       console.error(`[WS] Error:`, e.message);
-      sendTo(ws, 'error', { message: e.message }, msg?.cid);
+      sendTo(ws, 'error', { message: e.message }, cid);
     }
   });
 
