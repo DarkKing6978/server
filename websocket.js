@@ -232,6 +232,9 @@ class AnswerBuffer {
 
 const answerBuffer = new AnswerBuffer();
 
+// ── In-memory per-participant current question (not persisted to DB) ────────
+const participantCurrentQuestion = new Map(); // `${sessionId}:${participantId}` → questionId
+
 // ── HTTP server + WebSocket ────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -291,7 +294,7 @@ async function getSessionState(sessionId, full = false) {
       const res = await apiCall(`session-state.php?id=${encodeURIComponent(sessionId)}&full=1`);
       if (!res || !res.ok || !res.session) return null;
       const s = res.session;
-      // Merge buffer overlay for answers
+      // Merge buffer overlay for answers + current question
       if (s.participants) {
         const buffered = answerBuffer.getForSession(sessionId);
         for (const entry of buffered) {
@@ -304,6 +307,13 @@ async function getSessionState(sessionId, full = false) {
               manualScore: null,
               graded: false,
             };
+          }
+        }
+        // Inject in-memory currentQuestionId
+        for (const p of s.participants) {
+          const key = `${sessionId}:${p.id}`;
+          if (participantCurrentQuestion.has(key)) {
+            p.currentQuestionId = participantCurrentQuestion.get(key);
           }
         }
       }
@@ -605,6 +615,14 @@ const handlers = {
     sendTo(ws, 'pong', {}, msg.cid);
   },
 
+  "question.current"(ws, msg) {
+    const { sessionId, participantId, questionId } = msg;
+    if (!participantId || !questionId) return;
+    const key = `${sessionId}:${participantId}`;
+    participantCurrentQuestion.set(key, questionId);
+    broadcastEvent(sessionId, 'question.current', { participantId, questionId });
+  },
+
   registerParticipant(ws, msg) {
     ws._participantId = msg.participantId;
     if (ws._sessionId && msg.participantId) {
@@ -656,6 +674,7 @@ function handleConnection(ws, req) {
       if (participantSockets.get(key) === ws) {
         participantSockets.delete(key);
       }
+      participantCurrentQuestion.delete(key);
     }
     if (sessions.get(sessionId)?.size === 0) sessions.delete(sessionId);
   });
