@@ -231,7 +231,6 @@ const server = http.createServer((req, res) => {
 });
 
 const wss = new WebSocket.Server({ server, path: '/websocket' });
-const wssTeacher = new WebSocket.Server({ server, path: '/teacher-ws' });
 
 // Session → Set<WebSocket>
 const sessions = new Map();
@@ -521,14 +520,16 @@ const handlers = {
   },
 
   async   subscribe(ws, msg) {
-    const { sessionId, participantId, participantName, cid } = msg;
+    const { sessionId, participantId, participantName, role, cid } = msg;
     ws._sessionId = sessionId;
     ws._participantId = participantId;
+    ws._role = role || (participantId ? 'student' : 'unknown');
+    console.log(`[WS] Subscribe: ${ws._role} ${participantId || ''} → ${sessionId}`);
     if (participantId) {
       participantSockets.set(`${sessionId}:${participantId}`, ws);
       broadcastEvent(sessionId, 'participant.joined', { participantId, participantName });
     }
-    sendTo(ws, 'subscribed', { sessionId, participantId }, cid);
+    sendTo(ws, 'subscribed', { sessionId, participantId, role: ws._role }, cid);
   },
 
   heartbeat(ws, msg) {
@@ -553,7 +554,7 @@ function handleConnection(ws, req) {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  console.log(`[WS] Client connected: ${sessionId}`);
+  console.log(`[WS] Client connected: ${sessionId} (awaiting subscribe)`);
 
   if (!sessions.has(sessionId)) sessions.set(sessionId, new Set());
   sessions.get(sessionId).add(ws);
@@ -592,7 +593,6 @@ function handleConnection(ws, req) {
 }
 
 wss.on('connection', handleConnection);
-wssTeacher.on('connection', handleConnection);
 
 // ── Stats + Server-side ping (keeps Render proxy alive) ──────────────────────
 const HEARTBEAT_INTERVAL = 30000;
@@ -605,15 +605,13 @@ setInterval(() => {
 
 // Server-initiated pings to prevent Render proxy from killing idle connections
 setInterval(() => {
-  [wss, wssTeacher].forEach(server => {
-    server.clients.forEach((ws) => {
-      if (ws.isAlive === false) {
-        console.log('[WS] Terminating stale connection');
-        return ws.terminate();
-      }
-      ws.isAlive = false;
-      ws.ping();
-    });
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log('[WS] Terminating stale connection');
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
   });
 }, HEARTBEAT_INTERVAL);
 
@@ -623,7 +621,7 @@ async function start() {
   answerBuffer.startPeriodicFlush();
   server.listen(PORT, () => {
     console.log(`[WS] Server running on port ${PORT}`);
-    console.log(`[WS] WebSocket paths: /websocket (student), /teacher-ws (teacher)`);
+    console.log(`[WS] WebSocket path: /websocket`);
     console.log(`[WS] Health check: http://localhost:${PORT}/health`);
   });
 }
