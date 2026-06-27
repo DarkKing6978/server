@@ -13,29 +13,78 @@ const API_BASE_URL = process.env.API_BASE_URL || '';
 const SERVER_API_KEY = process.env.SERVER_API_KEY || '';
 
 // ── HTTP API helper ──────────────────────────────────────────────────────────
-async function apiCall(endpoint, method = 'GET', body = null, retries = 2) {
+// Cookie jar for anti-hotlink protection (InfinityFree returns HTML on first request)
+const _cookieJar = new Map(); // domain → cookie string
+
+function _extractCookie(response) {
+  const headers = response.headers;
+  const setCookie = headers.getSetCookie?.() || [];
+  for (const raw of setCookie) {
+    const parts = raw.split(';')[0].trim();
+    const eqIdx = parts.indexOf('=');
+    if (eqIdx > 0) {
+      const name = parts.substring(0, eqIdx).trim();
+      const value = parts.substring(eqIdx + 1).trim();
+      _cookieJar.set(name, value);
+    }
+  }
+}
+
+function _getCookieHeader() {
+  if (_cookieJar.size === 0) return undefined;
+  return Array.from(_cookieJar.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+async function apiCall(endpoint, method = 'GET', body = null, retries = 3) {
   if (!API_BASE_URL) throw new Error('API_BASE_URL not configured');
-  const url = `${API_BASE_URL.replace(/\/+$/, '')}/${endpoint.replace(/^\/+/, '')}`;
-  const opts = {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-  };
-  if (SERVER_API_KEY) opts.headers['X-SM-Server-Key'] = SERVER_API_KEY;
-  if (body) opts.body = JSON.stringify(body);
+  const baseUrl = API_BASE_URL.replace(/\/+$/, '');
+  const url = `${baseUrl}/${endpoint.replace(/^\/+/, '')}`;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
+      const opts = {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+      };
+      if (SERVER_API_KEY) opts.headers['X-SM-Server-Key'] = SERVER_API_KEY;
+      const cookie = _getCookieHeader();
+      if (cookie) opts.headers['Cookie'] = cookie;
+      if (body) opts.body = JSON.stringify(body);
+
       const res = await fetch(url, opts);
+
+      // Store any Set-Cookie headers
+      _extractCookie(res);
+
       const text = await res.text();
+
       // Handle anti-hotlink HTML responses
-      if (text.trim().startsWith('<!')) {
-        if (attempt < retries) { await sleep(300 * (attempt + 1)); continue; }
-        throw new Error('Got HTML instead of JSON (anti-hotlink)');
+      if (text.trim().startsWith('<!') || text.trim().startsWith('<html')) {
+        // Try to extract cookie from document.cookie in the HTML
+        const match = text.match(/document\.cookie\s*=\s*["']([^"']+)["']/);
+        if (match) {
+          const parts = match[1].split(';')[0].trim();
+          const eqIdx = parts.indexOf('=');
+          if (eqIdx > 0) {
+            _cookieJar.set(parts.substring(0, eqIdx).trim(), parts.substring(eqIdx + 1).trim());
+            console.log(`[API] Extracted anti-hotlink cookie from HTML`);
+          }
+        }
+        if (attempt < retries) {
+          console.log(`[API] Got HTML response (attempt ${attempt + 1}/${retries + 1}), retrying...`);
+          await sleep(500 * (attempt + 1));
+          continue;
+        }
+        throw new Error(`Got HTML instead of JSON from ${endpoint} (anti-hotlink)`);
       }
+
       const json = JSON.parse(text);
       return json;
     } catch (e) {
-      if (attempt < retries) { await sleep(300 * (attempt + 1)); continue; }
+      if (attempt < retries) {
+        await sleep(500 * (attempt + 1));
+        continue;
+      }
       throw e;
     }
   }
