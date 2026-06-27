@@ -231,6 +231,7 @@ const server = http.createServer((req, res) => {
 });
 
 const wss = new WebSocket.Server({ server, path: '/websocket' });
+const wssTeacher = new WebSocket.Server({ server, path: '/teacher-ws' });
 
 // Session → Set<WebSocket>
 const sessions = new Map();
@@ -542,12 +543,15 @@ const handlers = {
   },
 };
 
-// ── Connection handling ────────────────────────────────────────────────────
-wss.on('connection', (ws, req) => {
+// ── Connection handling (shared for both /websocket and /teacher-ws) ────────
+function handleConnection(ws, req) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const sessionId = url.searchParams.get('id');
 
   if (!sessionId) { ws.close(4000, 'Session ID required'); return; }
+
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
 
   console.log(`[WS] Client connected: ${sessionId}`);
 
@@ -574,18 +578,24 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     sessions.get(sessionId)?.delete(ws);
-    // Flush this participant's buffered answers before cleaning up
     if (ws._participantId) {
       answerBuffer.flushParticipant(ws._participantId);
-      participantSockets.delete(`${sessionId}:${ws._participantId}`);
+      const key = `${sessionId}:${ws._participantId}`;
+      if (participantSockets.get(key) === ws) {
+        participantSockets.delete(key);
+      }
     }
     if (sessions.get(sessionId)?.size === 0) sessions.delete(sessionId);
   });
 
   ws.on('error', (e) => console.error(`[WS] Error ${sessionId}:`, e.message));
-});
+}
 
-// ── Stats ──────────────────────────────────────────────────────────────────
+wss.on('connection', handleConnection);
+wssTeacher.on('connection', handleConnection);
+
+// ── Stats + Server-side ping (keeps Render proxy alive) ──────────────────────
+const HEARTBEAT_INTERVAL = 30000;
 setInterval(() => {
   let total = 0, active = 0;
   sessions.forEach((c, id) => { total += c.size; if (c.size > 0) active++; });
@@ -593,13 +603,27 @@ setInterval(() => {
   console.log(`[WS] ${active} sessions, ${total} connections, ${buffered} buffered answers`);
 }, 60000);
 
+// Server-initiated pings to prevent Render proxy from killing idle connections
+setInterval(() => {
+  [wss, wssTeacher].forEach(server => {
+    server.clients.forEach((ws) => {
+      if (ws.isAlive === false) {
+        console.log('[WS] Terminating stale connection');
+        return ws.terminate();
+      }
+      ws.isAlive = false;
+      ws.ping();
+    });
+  });
+}, HEARTBEAT_INTERVAL);
+
 // ── Start ──────────────────────────────────────────────────────────────────
 async function start() {
   await getDb();
   answerBuffer.startPeriodicFlush();
   server.listen(PORT, () => {
     console.log(`[WS] Server running on port ${PORT}`);
-    console.log(`[WS] WebSocket path: /websocket`);
+    console.log(`[WS] WebSocket paths: /websocket (student), /teacher-ws (teacher)`);
     console.log(`[WS] Health check: http://localhost:${PORT}/health`);
   });
 }
