@@ -408,7 +408,7 @@ const handlers = {
         return;
       }
       sendTo(ws, 'participant.patched', { ok: true, participantId }, cid);
-      if (fields?.finished || fields?.paused !== undefined || fields?.integrity) {
+      if (fields?.finished || fields?.paused !== undefined || fields?.integrity || fields?.status || fields?.extraBlockTimeAdded) {
         broadcastEvent(sessionId, 'participant.updated', { participantId, fields });
       }
     } catch (e) {
