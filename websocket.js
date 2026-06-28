@@ -623,6 +623,86 @@ const handlers = {
     broadcastEvent(sessionId, 'question.current', { participantId, questionId });
   },
 
+  async addQuestionTime(ws, msg) {
+    const { sessionId, participantId, questionId, seconds, cid } = msg;
+    try {
+      const res = await apiCall('save.php', 'PATCH', {
+        op: 'patchParticipant', sessionId, participantId,
+        fields: { extraQuestionTime: { [questionId]: seconds } },
+      });
+      sendTo(ws, 'participant.patched', { ok: !!res?.ok, participantId }, cid);
+      if (res?.ok) broadcastEvent(sessionId, 'participant.updated', { participantId, fields: { extraQuestionTime: { [questionId]: seconds } } });
+    } catch (e) {
+      console.error('[WS] addQuestionTime error:', e.message);
+      sendTo(ws, 'participant.patched', { ok: false, error: e.message }, cid);
+    }
+  },
+
+  async saveTimers(ws, msg) {
+    const { sessionId, participantId, savedTimers, savedTotalTimeLeft, cid } = msg;
+    try {
+      const res = await apiCall('save.php', 'PATCH', {
+        op: 'patchParticipant', sessionId, participantId,
+        fields: { savedTimers, savedTotalTimeLeft },
+      });
+      sendTo(ws, 'participant.patched', { ok: !!res?.ok, participantId }, cid);
+    } catch (e) {
+      console.error('[WS] saveTimers error:', e.message);
+      sendTo(ws, 'participant.patched', { ok: false, error: e.message }, cid);
+    }
+  },
+
+  async setManualGrade(ws, msg) {
+    const { sessionId, participantId, questionId, value, testId, manualScore, graded, cid } = msg;
+    try {
+      const res = await apiCall('answers.php', 'POST', {
+        sessionId, participantId: String(participantId), questionId: String(questionId),
+        value: value ?? '', testId: testId || '', manualScore, graded: true,
+      });
+      sendTo(ws, 'answer.graded', { ok: !!res?.ok, questionId, participantId }, cid);
+      if (res?.ok) broadcastEvent(sessionId, 'answer.graded', { participantId, questionId, manualScore, graded: true });
+    } catch (e) {
+      console.error('[WS] setManualGrade error:', e.message);
+      sendTo(ws, 'answer.graded', { ok: false, error: e.message }, cid);
+    }
+  },
+
+  async joinSession(ws, msg) {
+    const { sessionId, code, participantName, participantId, cid } = msg;
+    try {
+      const res = await apiCall('save.php', 'PATCH', {
+        op: 'joinSession', sessionId, code, participantName, participantId,
+      });
+      sendTo(ws, 'join.result', { ok: !!res?.ok, ...res }, cid);
+      if (res?.ok) broadcastEvent(sessionId, 'participant.joined', { participantId, participantName });
+    } catch (e) {
+      console.error('[WS] joinSession error:', e.message);
+      sendTo(ws, 'join.result', { ok: false, error: e.message }, cid);
+    }
+  },
+
+  async fetchSessionByCode(ws, msg) {
+    const { code, cid } = msg;
+    try {
+      const res = await apiCall(`session-state.php?code=${encodeURIComponent(code)}&full=1`);
+      sendTo(ws, 'session.lookup', { ok: !!res?.ok, session: res?.session || res }, cid);
+    } catch (e) {
+      console.error('[WS] fetchSessionByCode error:', e.message);
+      sendTo(ws, 'session.lookup', { ok: false, error: e.message }, cid);
+    }
+  },
+
+  async fetchSessionLight(ws, msg) {
+    const { sessionId, cid } = msg;
+    try {
+      const res = await apiCall(`init-session.php?id=${encodeURIComponent(sessionId)}`);
+      sendTo(ws, 'session.light', { ok: !!res, ...res }, cid);
+    } catch (e) {
+      console.error('[WS] fetchSessionLight error:', e.message);
+      sendTo(ws, 'session.light', { ok: false, error: e.message }, cid);
+    }
+  },
+
   registerParticipant(ws, msg) {
     ws._participantId = msg.participantId;
     if (ws._sessionId && msg.participantId) {
