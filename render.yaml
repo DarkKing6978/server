@@ -11,6 +11,15 @@ services:
       - key: NODE_ENV
         value: production
       - key: API_BASE_URL
-        value: https://slidemath.at.ua/api
+        value: https://slidemath.page.gd/api
       - key: SERVER_API_KEY
         value: slidemath_ws_server_2026
+      # AI (Gemini): ключ задається в дашборді Render (sync: false — не у репозиторії)
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.6-flash
+      - key: GEMINI_MAX_OUTPUT_TOKENS
+        value: 16384
+      - key: AI_RATE_MAX
+        value: 30

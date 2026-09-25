@@ -104,6 +104,622 @@ async function apiCall(endpoint, method = 'GET', body = null, retries = 3) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ── AI (Gemini) proxy ───────────────────────────────────────────────────────
+// Ключ зберігається ЛИШЕ в env сервісу (Render), у клієнт і PHP не потрапляє.
+// Браузер → POST /ai (X-SM-Auth/X-SM-User) → перевірка ролі через PHP me.php
+// → Gemini generateContent → JSON у відповідь.
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+const GEMINI_API_BASE = (process.env.GEMINI_API_BASE || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
+const GEMINI_MAX_OUTPUT_TOKENS = parseInt(process.env.GEMINI_MAX_OUTPUT_TOKENS, 10) || 16384;
+const GEMINI_THINKING_LEVEL = (process.env.GEMINI_THINKING_LEVEL || '').toLowerCase();
+
+const AI_BODY_LIMIT = 300 * 1024;
+const AI_TIMEOUT_MS = 90000;
+const AI_RATE_WINDOW_MS = 60 * 60 * 1000;
+const AI_RATE_MAX = parseInt(process.env.AI_RATE_MAX, 10) || 30;
+const AI_MAX_QUESTIONS = 40;
+const AI_MAX_SLIDES = 30;
+const AI_MAX_TEXT = 6000;
+
+const AI_ACTIONS = new Set([
+  'generate_questions',   // лише питання (в редактор тесту)
+  'generate_full_test',   // повний тест (з налаштуваннями)
+  'generate_explanations',// пояснення до питань
+  'generate_slides',      // слайди для редактора уроку
+  'grade_answer',         // перевірка відкритої відповіді (пропозиція)
+]);
+
+const _aiRate = new Map();  // userId → { count, resetAt }
+const _meCache = new Map(); // sha256(user:token) → { user, exp }
+
+const AI_SYSTEM_INSTRUCTION =
+  'Ти — асистент учителя математики для української освітньої платформи SlideMath. ' +
+  'Відповідай ЛИШЕ валідним JSON — без markdown-обгородження, без пояснень до або після JSON. ' +
+  'Уся мова контенту — українська (якщо прямо не вказано інше). ' +
+  'Математичні формули записуй у LaTeX: \\( ... \\) усередині рядка, \\[ ... \\] для блоків. ' +
+  'Не додавай персональні дані, імена чи оцінки реальних людей.';
+
+// ── AI: читання тіла запиту ─────────────────────────────────────────────────
+function aiReadBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    let size = 0;
+    let done = false;
+    req.on('data', chunk => {
+      if (done) return;
+      size += chunk.length;
+      if (size > limit) {
+        done = true;
+        reject(new Error('too_large'));
+        req.destroy();
+        return;
+      }
+      data += chunk;
+    });
+    req.on('end', () => { if (!done) { done = true; resolve(data); } });
+    req.on('error', err => { if (!done) { done = true; reject(err); } });
+  });
+}
+
+// ── AI: rate limit (in-memory, на користувача) ──────────────────────────────
+function aiRateCheck(userId) {
+  const now = Date.now();
+  const rec = _aiRate.get(userId);
+  if (!rec || rec.resetAt <= now) {
+    _aiRate.set(userId, { count: 1, resetAt: now + AI_RATE_WINDOW_MS });
+    if (_aiRate.size > 2000) {
+      for (const [k, v] of _aiRate) { if (v.resetAt <= now) _aiRate.delete(k); }
+    }
+    return { ok: true };
+  }
+  if (rec.count >= AI_RATE_MAX) return { ok: false, resetAt: rec.resetAt };
+  rec.count += 1;
+  return { ok: true };
+}
+
+// ── AI: перевірка користувача через PHP API (me.php) ────────────────────────
+async function aiFetchJson(url, opts, retries = 2) {
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, opts);
+      _extractCookie(res);
+      const text = await res.text();
+      if (text.trim().startsWith('<!') || text.trim().startsWith('<html')) {
+        const cookieValue = _solveAntiHotlink(text);
+        if (cookieValue) _cookieJar.set('__test', cookieValue);
+        lastErr = new Error('HTML instead of JSON (anti-hotlink)');
+        if (attempt < retries) { await sleep(300 * (attempt + 1)); continue; }
+        throw lastErr;
+      }
+      return { status: res.status, json: JSON.parse(text) };
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries) { await sleep(300 * (attempt + 1)); continue; }
+      throw lastErr;
+    }
+  }
+  throw lastErr || new Error('request failed');
+}
+
+async function aiResolveUser(req) {
+  const token = req.headers['x-sm-auth'];
+  const userId = req.headers['x-sm-user'];
+  if (!token || !userId) return null;
+
+  const cacheKey = crypto.createHash('sha256').update(`${userId}:${token}`).digest('hex');
+  const hit = _meCache.get(cacheKey);
+  if (hit && hit.exp > Date.now()) return hit.user;
+  if (_meCache.size > 1000) {
+    const now = Date.now();
+    for (const [k, v] of _meCache) { if (v.exp <= now) _meCache.delete(k); }
+  }
+
+  if (!API_BASE_URL) throw new Error('API_BASE_URL not configured');
+  const url = `${API_BASE_URL.replace(/\/+$/, '')}/me.php`;
+  const opts = {
+    method: 'GET',
+    headers: { 'Content-Type': 'application/json', 'X-SM-Auth': String(token), 'X-SM-User': String(userId) },
+  };
+  const cookie = _getCookieHeader();
+  if (cookie) opts.headers['Cookie'] = cookie;
+
+  const { status, json } = await aiFetchJson(url, opts);
+  if (status !== 200 || !json || !json.ok || !json.user) return null;
+  const user = { id: String(json.user.id || userId), role: json.user.role || 'student', status: json.user.status || '' };
+  _meCache.set(cacheKey, { user, exp: Date.now() + 60000 });
+  return user;
+}
+
+// ── AI: виклик Gemini ───────────────────────────────────────────────────────
+function aiSchema(schema) {
+  // responseSchema бо responseJsonSchema: надсилаємо класичний responseSchema.
+  return schema;
+}
+
+async function aiGenerate({ systemInstruction, userMessage, schema }) {
+  if (!GEMINI_API_KEY) throw Object.assign(new Error('GEMINI_API_KEY not configured'), { code: 503 });
+
+  const generationConfig = {
+    responseMimeType: 'application/json',
+    responseSchema: aiSchema(schema),
+    maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS,
+  };
+  if (GEMINI_THINKING_LEVEL === 'low' || GEMINI_THINKING_LEVEL === 'medium' || GEMINI_THINKING_LEVEL === 'high') {
+    generationConfig.thinkingLevel = GEMINI_THINKING_LEVEL.toUpperCase();
+  }
+
+  const body = {
+    systemInstruction: { parts: [{ text: systemInstruction }] },
+    contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+    generationConfig,
+  };
+
+  const url = `${GEMINI_API_BASE}/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(AI_TIMEOUT_MS),
+  });
+
+  const text = await res.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch { /* ignore */ }
+
+  if (!res.ok) {
+    const msg = (data && data.error && data.error.message) ? data.error.message : `HTTP ${res.status}`;
+    const err = new Error(`Gemini API: ${msg}`);
+    err.code = res.status === 429 ? 429 : 502;
+    throw err;
+  }
+
+  const parts = (data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+  const out = parts.map(p => (p && p.text) || '').join('');
+  if (!out.trim()) {
+    const finish = data && data.candidates && data.candidates[0] && data.candidates[0].finishReason;
+    const blocked = data && data.promptFeedback && data.promptFeedback.blockReason;
+    const err = new Error(`Порожня відповідь AI${blocked ? ` (blocked: ${blocked})` : ''}${finish ? ` (finishReason: ${finish})` : ''}`);
+    err.code = 502;
+    throw err;
+  }
+  return out;
+}
+
+function aiParseJsonLoose(text) {
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { /* not plain JSON */ }
+  const fenced = text.replace(/^\s*```(?:json)?/i, '').replace(/```\s*$/i, '').trim();
+  try { return JSON.parse(fenced); } catch { /* ignore */ }
+  const start = text.indexOf('{');
+  const startArr = text.indexOf('[');
+  const s = (start === -1 || (startArr !== -1 && startArr < start)) ? startArr : start;
+  if (s === -1) return null;
+  const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
+  if (end <= s) return null;
+  try { return JSON.parse(text.slice(s, end + 1)); } catch { return null; }
+}
+
+function aiStr(v, max = AI_MAX_TEXT) {
+  if (v === null || v === undefined) return '';
+  return String(v).slice(0, max).trim();
+}
+
+function aiInt(v, min, max, dflt) {
+  const n = parseInt(v, 10);
+  if (Number.isNaN(n)) return dflt;
+  return Math.min(max, Math.max(min, n));
+}
+
+function aiStrList(v, maxLen = 40, itemMax = 60) {
+  if (!Array.isArray(v)) return [];
+  return v.map(x => aiStr(x, itemMax)).filter(Boolean).slice(0, maxLen);
+}
+
+// ── AI: схеми відповідей ────────────────────────────────────────────────────
+const AI_QUESTION_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    type: { type: 'STRING', enum: ['single', 'multiple', 'short', 'long', 'ordering', 'matching'] },
+    prompt: { type: 'STRING' },
+    points: { type: 'INTEGER' },
+    options: { type: 'ARRAY', items: { type: 'STRING' } },
+    correctIndexes: { type: 'ARRAY', items: { type: 'INTEGER' } },
+    acceptedAnswers: { type: 'ARRAY', items: { type: 'STRING' } },
+    items: { type: 'ARRAY', items: { type: 'STRING' } },
+    correctOrder: { type: 'ARRAY', items: { type: 'INTEGER' } },
+    pairs: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: { left: { type: 'STRING' }, right: { type: 'STRING' } },
+        required: ['left', 'right'],
+      },
+    },
+    modelAnswer: { type: 'STRING' },
+    explanation: { type: 'STRING' },
+  },
+  required: ['type', 'prompt'],
+};
+
+const AI_TEST_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    title: { type: 'STRING' },
+    subtitle: { type: 'STRING' },
+    topics: { type: 'ARRAY', items: { type: 'STRING' } },
+    questions: { type: 'ARRAY', items: AI_QUESTION_SCHEMA },
+  },
+  required: ['title', 'questions'],
+};
+
+const AI_QUESTIONS_SCHEMA = {
+  type: 'OBJECT',
+  properties: { questions: { type: 'ARRAY', items: AI_QUESTION_SCHEMA } },
+  required: ['questions'],
+};
+
+const AI_EXPLANATIONS_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    explanations: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: {
+          id: { type: 'STRING' },
+          explanation: { type: 'STRING' },
+          modelAnswer: { type: 'STRING' },
+        },
+        required: ['id', 'explanation'],
+      },
+    },
+  },
+  required: ['explanations'],
+};
+
+const AI_GRADE_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    score: { type: 'NUMBER' },
+    comment: { type: 'STRING' },
+    confidence: { type: 'STRING', enum: ['high', 'medium', 'low'] },
+  },
+  required: ['score', 'comment'],
+};
+
+const AI_SLIDES_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    title: { type: 'STRING' },
+    slides: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: { title: { type: 'STRING' }, body: { type: 'STRING' } },
+        required: ['title', 'body'],
+      },
+    },
+  },
+  required: ['title', 'slides'],
+};
+
+// ── AI: промпти ─────────────────────────────────────────────────────────────
+function aiQuestionSpec({ withExplanations, withModelAnswers }) {
+  let s =
+    'Кожне питання — об\'єкт із полями:\n' +
+    '- "type": "single" | "multiple" | "short" | "long" | "ordering" | "matching"\n' +
+    '- "prompt": текст питання (LaTeX у \\( \\));\n' +
+    '- "points": ціле число балів (зазвичай 1);\n' +
+    '- для "single"/"multiple": "options" — масив РІВНО 4 різних варіантів відповіді, ' +
+    '"correctIndexes" — масив індексів правильної відповіді (single: рівно 1, multiple: 2-3);\n' +
+    '- для "short": "acceptedAnswers" — масив із 1-3 прийнятних коротких відповідей;\n' +
+    '- для "ordering": "items" — 3-5 елементів у довільному (перемішаному) порядку, ' +
+    '"correctOrder" — масив індексів 0..n-1, що задає правильний порядок;\n' +
+    '- для "matching": "pairs" — 3-4 об\'єкти {"left": "...", "right": "..."};\n';
+  if (withModelAnswers) {
+    s += '- для "long": "modelAnswer" — короткий еталон відповіді (5-10 речень);\n';
+  }
+  if (withExplanations) {
+    s += '- "explanation": пояснення для учня (2-4 речення): чому відповідь правильна і типова помилка.\n';
+  }
+  s += 'Варіанти відповідей мають бути правдоподібними (один явно правильний, решта — типові помилки), без \'усі з вищевказаних\'.';
+  return s;
+}
+
+function aiBuildQuestionsRequest(p, { fullTest }) {
+  const count = aiInt(p.count, 1, AI_MAX_QUESTIONS, 10);
+  const types = aiStrList(p.types, 6, 20).filter(t => AI_QUESTION_SCHEMA.properties.type.enum.includes(t));
+  const withExplanations = p.withExplanations !== false;
+  const withModelAnswers = p.includeModelAnswers !== false;
+  const topic = aiStr(p.topic, 300);
+  const grade = aiStr(p.grade, 30);
+  const difficulty = aiStr(p.difficulty, 60) || 'середня';
+  const language = aiStr(p.language, 40) || 'українська';
+  const customTitle = aiStr(p.title, 200);
+
+  let msg = `Створи навчальний матеріал для платформи SlideMath.\n\n` +
+    `Тема: ${topic || '(вказана в контексті)'}\n` +
+    `Клас/рівень: ${grade || 'невідомо'}\n` +
+    `Складність: ${difficulty}\n` +
+    `Мова: ${language}\n` +
+    `Кількість запитань: ${count}\n` +
+    `Дозволені типи запитань: ${(types.length ? types : AI_QUESTION_SCHEMA.properties.type.enum).join(', ')}\n` +
+    (customTitle ? `Заголовок тесту: ${customTitle}\n` : '') +
+    `\n${aiQuestionSpec({ withExplanations, withModelAnswers })}\n`;
+
+  if (fullTest) {
+    msg += `\nЦе повний тест. Додай поле "title" (заголовок тесту), "subtitle" і "topics" (2-4 короткі теми). ` +
+      `Час та античит-налаштування задає вчитель окремо — їх не повертай.`;
+  }
+
+  return {
+    systemInstruction: AI_SYSTEM_INSTRUCTION,
+    userMessage: msg,
+    schema: fullTest ? AI_TEST_SCHEMA : AI_QUESTIONS_SCHEMA,
+    meta: { count, withExplanations, withModelAnswers, types },
+  };
+}
+
+function aiBuildExplanationsRequest(p) {
+  const list = Array.isArray(p.questions) ? p.questions.slice(0, AI_MAX_QUESTIONS) : [];
+  if (!list.length) throw Object.assign(new Error('Порожній список питань'), { code: 400 });
+  const withModelAnswers = p.includeModelAnswers !== false;
+
+  const lines = list.map((q, i) => {
+    const parts = [
+      `${i + 1}) id="${aiStr(q.id, 60)}"`,
+      `type=${aiStr(q.type, 20)}`,
+      `питання: ${aiStr(q.prompt, 2000)}`,
+    ];
+    if (q.correctAnswer) parts.push(`правильна відповідь: ${aiStr(q.correctAnswer, 1000)}`);
+    if (q.modelAnswer) parts.push(`еталон: ${aiStr(q.modelAnswer, 2000)}`);
+    if (q.options && Array.isArray(q.options) && q.options.length) {
+      parts.push(`варіанти: ${q.options.map((o, j) => `[${j}] ${aiStr(o, 300)}`).join(' | ')}`);
+    }
+    return parts.join('; ');
+  });
+
+  const msg =
+    `Для кожного запитання із списку напиши пояснення для учня після проходження тесту.\n` +
+    `Вимоги до "explanation": 2-4 речення українською, поясни правильну відповідь і назви типову помилку; ` +
+    `без оцінок, без звернень по імені.\n` +
+    (withModelAnswers
+      ? `Для типу "long" також поверни "modelAnswer" — стислий еталон відповіді (5-8 речень).\n`
+      : '') +
+    `Поверни ОДИН об'єкт {"explanations": [{"id": "...", "explanation": "..."}]}, id — точно як у списку.\n\n` +
+    `Питання:\n${lines.join('\n')}`;
+
+  return { systemInstruction: AI_SYSTEM_INSTRUCTION, userMessage: msg, schema: AI_EXPLANATIONS_SCHEMA };
+}
+
+function aiBuildGradeRequest(p) {
+  const maxPoints = Math.max(0.5, Number(p.maxPoints) || 1);
+  const prompt = aiStr(p.prompt, 4000);
+  const studentAnswer = aiStr(p.studentAnswer, 8000);
+  if (!prompt) throw Object.assign(new Error('Відсутній текст питання'), { code: 400 });
+  if (!studentAnswer) throw Object.assign(new Error('Відсутня відповідь учня'), { code: 400 });
+
+  const msg =
+    `Перевір відповідь учня на відкрите запитання. Це ПРОПОЗИЦІЯ оцінки для вчителя (він підтвердить її вручну).\n\n` +
+    `Запитання: ${prompt}\n` +
+    (p.modelAnswer ? `Еталонна відповідь учителя: ${aiStr(p.modelAnswer, 4000)}\n` : '') +
+    (p.explanation ? `Пояснення до запитання: ${aiStr(p.explanation, 4000)}\n` : '') +
+    `Максимум балів: ${maxPoints}\n` +
+    `Відповідь учня: ${studentAnswer}\n\n` +
+    `Критерії: оцінюй лише змістовну частину відповіді (математичну правильність, повноту, обґрунтування). ` +
+    `Ігноруй орфографію, форматування та зайву воду. Якщо відповідь правильна за змістом — максимум балів; ` +
+    `якщо частково — пропорційно; якщо суттєво помилкова або не по темі — 0.\n` +
+    `"score" — число від 0 до ${maxPoints} (дозволені дробні), "comment" — 1-3 речення українською для вчителя, ` +
+    `за потреби поясни зниження балу. "confidence" — наскільки впевнена оцінка.`;
+
+  return { systemInstruction: AI_SYSTEM_INSTRUCTION, userMessage: msg, schema: AI_GRADE_SCHEMA, meta: { maxPoints } };
+}
+
+function aiBuildSlidesRequest(p) {
+  const count = aiInt(p.count, 1, AI_MAX_SLIDES, 8);
+  const topic = aiStr(p.topic, 300);
+  const grade = aiStr(p.grade, 30);
+  const points = aiStrList(p.points, 20, 200);
+  const language = aiStr(p.language, 40) || 'українська';
+
+  const msg =
+    `Створи навчальні слайди для уроку на платформі SlideMath.\n\n` +
+    `Тема: ${topic}\n` +
+    `Клас/рівень: ${grade || 'невідомо'}\n` +
+    `Кількість слайдів: ${count}\n` +
+    `Мова: ${language}\n` +
+    (points.length ? `Обов'язкові пункти: ${points.join('; ')}\n` : '') +
+    `\nКожен слайд: "title" — короткий заголовок; "body" — контент у Markdown (2-5 пунктів списку ` +
+    `або 1-2 абзаци). Формули — LaTeX у \\( \\) / \\[ \\]. Не використовуй таблиці зображень, ` +
+    `посилання на зовнішні ресурси чи HTML-теги. Перший слайд — вступний, останній — підсумок/висновки.`;
+
+  return { systemInstruction: AI_SYSTEM_INSTRUCTION, userMessage: msg, schema: AI_SLIDES_SCHEMA };
+}
+
+// ── AI: валідація результату від моделі ─────────────────────────────────────
+function aiValidateQuestions(result, meta) {
+  const raw = result && Array.isArray(result.questions) ? result.questions : [];
+  const allowedTypes = AI_QUESTION_SCHEMA.properties.type.enum;
+  const questions = [];
+  for (const q of raw) {
+    if (!q || typeof q !== 'object') continue;
+    const type = allowedTypes.includes(q.type) ? q.type : null;
+    const prompt = aiStr(q.prompt, 4000);
+    if (!type || !prompt) continue;
+    const out = { type, prompt, points: aiInt(q.points, 1, 100, 1) };
+
+    if (type === 'single' || type === 'multiple') {
+      const options = (Array.isArray(q.options) ? q.options : []).map(o => aiStr(o, 1000)).filter(Boolean).slice(0, 8);
+      if (options.length < 2) continue;
+      let correct = (Array.isArray(q.correctIndexes) ? q.correctIndexes : [])
+        .map(n => parseInt(n, 10)).filter(n => Number.isInteger(n) && n >= 0 && n < options.length);
+      correct = Array.from(new Set(correct)).sort((a, b) => a - b);
+      if (!correct.length) continue;
+      if (type === 'single' && correct.length > 1) correct = [correct[0]];
+      if (type === 'multiple' && correct.length < 2) continue;
+      out.options = options;
+      out.correctIndexes = correct;
+    } else if (type === 'short') {
+      const acc = (Array.isArray(q.acceptedAnswers) ? q.acceptedAnswers : []).map(a => aiStr(a, 300)).filter(Boolean).slice(0, 5);
+      if (!acc.length) continue;
+      out.acceptedAnswers = acc;
+    } else if (type === 'ordering') {
+      const items = (Array.isArray(q.items) ? q.items : []).map(i => aiStr(i, 500)).filter(Boolean).slice(0, 8);
+      if (items.length < 2) continue;
+      let order = (Array.isArray(q.correctOrder) ? q.correctOrder : []).map(n => parseInt(n, 10))
+        .filter(n => Number.isInteger(n) && n >= 0 && n < items.length);
+      order = Array.from(new Set(order));
+      if (order.length !== items.length) order = items.map((_, i) => i);
+      out.items = items;
+      out.correctOrder = order;
+    } else if (type === 'matching') {
+      const pairs = (Array.isArray(q.pairs) ? q.pairs : [])
+        .filter(pr => pr && typeof pr === 'object')
+        .map(pr => ({ left: aiStr(pr.left, 500), right: aiStr(pr.right, 500) }))
+        .filter(pr => pr.left && pr.right).slice(0, 8);
+      if (pairs.length < 2) continue;
+      out.pairs = pairs;
+    }
+
+    if (type === 'long') {
+      const ma = aiStr(q.modelAnswer, 6000);
+      if (meta && meta.withModelAnswers && ma) out.modelAnswer = ma;
+    }
+    if (meta && meta.withExplanations) {
+      const ex = aiStr(q.explanation, 4000);
+      if (ex) out.explanation = ex;
+    }
+    questions.push(out);
+    if (questions.length >= (meta && meta.count ? meta.count : AI_MAX_QUESTIONS)) break;
+  }
+  return questions;
+}
+
+// ── AI: головний обробник POST /ai ──────────────────────────────────────────
+async function handleAiRequest(req, res) {
+  const send = (code, obj) => {
+    if (res.headersSent) return;
+    res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(obj));
+  };
+
+  if (!GEMINI_API_KEY) return send(503, { ok: false, error: 'AI ще не налаштовано: додайте GEMINI_API_KEY у сервісі Render.' });
+
+  let bodyText;
+  try {
+    bodyText = await aiReadBody(req, AI_BODY_LIMIT);
+  } catch (e) {
+    return send(e && e.message === 'too_large' ? 413 : 400, { ok: false, error: 'Некоректне тіло запиту' });
+  }
+
+  let payload;
+  try { payload = JSON.parse(bodyText || '{}'); } catch { return send(400, { ok: false, error: 'Некоректний JSON' }); }
+
+  const action = payload && payload.action;
+  if (!AI_ACTIONS.has(action)) return send(400, { ok: false, error: 'Невідома дія' });
+
+  // 1) Автентифікація + роль (перевірка через PHP me.php).
+  let user = null;
+  try {
+    user = await aiResolveUser(req);
+  } catch (e) {
+    console.error('[AI] me.php failed:', e.message);
+    return send(502, { ok: false, error: 'Не вдалося перевірити користувача. Спробуйте ще раз.' });
+  }
+  if (!user) return send(401, { ok: false, error: 'Потрібен вхід в акаунт' });
+
+  const role = user.role;
+  if (!(role === 'admin' || role === 'teacher')) {
+    return send(403, { ok: false, error: 'Генерація та AI-перевірка доступні лише вчителям' });
+  }
+  if (role === 'teacher' && user.status && user.status !== 'active') {
+    return send(403, { ok: false, error: 'Акаунт вчителя ще не активовано' });
+  }
+
+  // 2) Rate limit.
+  const rl = aiRateCheck(user.id);
+  if (!rl.ok) {
+    const mins = Math.max(1, Math.ceil((rl.resetAt - Date.now()) / 60000));
+    return send(429, { ok: false, error: `Забагато AI-запитів. Спробуйте за ${mins} хв.` });
+  }
+
+  // 3) Побудова запиту до моделі.
+  let request;
+  try {
+    const params = payload.params || {};
+    if (action === 'generate_questions') request = aiBuildQuestionsRequest(params, { fullTest: false });
+    else if (action === 'generate_full_test') request = aiBuildQuestionsRequest(params, { fullTest: true });
+    else if (action === 'generate_explanations') request = aiBuildExplanationsRequest(params);
+    else if (action === 'generate_slides') request = aiBuildSlidesRequest(params);
+    else if (action === 'grade_answer') request = aiBuildGradeRequest(params);
+  } catch (e) {
+    return send(e.code || 400, { ok: false, error: e.message || 'Некоректні параметри' });
+  }
+
+  // 4) Виклик Gemini.
+  const started = Date.now();
+  let raw;
+  try {
+    raw = await aiGenerate(request);
+  } catch (e) {
+    console.error(`[AI] ${action} failed after ${Date.now() - started}ms:`, e.message);
+    return send(e.code || 502, { ok: false, error: e.message || 'AI недоступний' });
+  }
+
+  const parsed = aiParseJsonLoose(raw);
+  if (!parsed) {
+    console.error(`[AI] ${action}: JSON parse failed, raw length=${raw.length}`);
+    return send(502, { ok: false, error: 'AI повернув некоректну відповідь. Спробуйте ще раз.' });
+  }
+
+  // 5) Валідація результату.
+  let result;
+  try {
+    if (action === 'generate_questions' || action === 'generate_full_test') {
+      const questions = aiValidateQuestions(parsed, request.meta);
+      if (!questions.length) throw Object.assign(new Error('AI не зміг згенерувати валідні запитання. Спробуйте змінити параметри.'), { code: 502 });
+      result = {
+        title: aiStr(parsed.title, 200),
+        subtitle: aiStr(parsed.subtitle, 300),
+        topics: aiStrList(parsed.topics, 6, 60),
+        questions,
+      };
+    } else if (action === 'generate_explanations') {
+      const list = Array.isArray(parsed.explanations) ? parsed.explanations : [];
+      result = {
+        explanations: list
+          .filter(x => x && x.id)
+          .map(x => ({ id: aiStr(x.id, 60), explanation: aiStr(x.explanation, 4000), modelAnswer: aiStr(x.modelAnswer, 6000) }))
+          .filter(x => x.explanation),
+      };
+      if (!result.explanations.length) throw Object.assign(new Error('AI не повернув пояснень'), { code: 502 });
+    } else if (action === 'grade_answer') {
+      const maxPoints = request.meta.maxPoints;
+      const scoreRaw = Number(parsed.score);
+      const score = Number.isFinite(scoreRaw) ? Math.min(maxPoints, Math.max(0, Math.round(scoreRaw * 100) / 100)) : 0;
+      const confidence = ['high', 'medium', 'low'].includes(parsed.confidence) ? parsed.confidence : 'medium';
+      result = { score, comment: aiStr(parsed.comment, 2000), confidence, maxPoints };
+    } else if (action === 'generate_slides') {
+      const slides = (Array.isArray(parsed.slides) ? parsed.slides : [])
+        .map(s => ({ title: aiStr(s && s.title, 300), body: aiStr(s && s.body, 8000) }))
+        .filter(s => s.title && s.body)
+        .slice(0, AI_MAX_SLIDES);
+      if (!slides.length) throw Object.assign(new Error('AI не зміг згенерувати слайди'), { code: 502 });
+      result = { title: aiStr(parsed.title, 200), slides };
+    } else {
+      result = parsed;
+    }
+  } catch (e) {
+    return send(e.code || 502, { ok: false, error: e.message || 'AI повернув некоректні дані' });
+  }
+
+  console.log(`[AI] ${action} ok for ${user.id} (${role}) in ${Date.now() - started}ms`);
+  send(200, { ok: true, action, model: GEMINI_MODEL, result });
+}
+
 // ── Answer Buffer ──────────────────────────────────────────────────────────
 // Buffers student answers in memory, flushes to PHP API in batch.
 // Key = "participantId:questionId" → stores only the LATEST value per question.
@@ -238,8 +854,8 @@ const participantCurrentQuestion = new Map(); // `${sessionId}:${participantId}`
 // ── HTTP server + WebSocket ────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-SM-Auth, X-SM-User');
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
@@ -254,7 +870,24 @@ const server = http.createServer((req, res) => {
       connections: Array.from(sessions.values()).reduce((sum, s) => sum + s.size, 0),
       bufferedAnswers: answerBuffer.size(),
       apiBase: API_BASE_URL ? '(configured)' : '(not set)',
+      ai: GEMINI_API_KEY ? GEMINI_MODEL : '(not configured)',
     }));
+    return;
+  }
+
+  if (url.pathname === '/ai') {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: 'Method not allowed' }));
+      return;
+    }
+    handleAiRequest(req, res).catch(e => {
+      console.error('[AI] unhandled error:', e);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Внутрішня помилка AI-сервісу' }));
+      }
+    });
     return;
   }
 
