@@ -116,7 +116,10 @@ const GEMINI_MAX_OUTPUT_TOKENS = parseInt(process.env.GEMINI_MAX_OUTPUT_TOKENS, 
 const GEMINI_THINKING_LEVEL = (process.env.GEMINI_THINKING_LEVEL || '').toLowerCase();
 
 const AI_BODY_LIMIT = 300 * 1024;
-const AI_TIMEOUT_MS = 90000;
+const AI_TIMEOUT_MS = 60000;                 // таймаут ОДНІЄЇ спроби
+const AI_DEADLINE_MS = 140000;               // дедлайн на весь запит (генерація)
+const AI_DEADLINE_GRADE_MS = 80000;          // grade_answer (клієнт чекає 90с)
+const AI_RETRY_DELAYS_MS = [1000, 3000, 7000];
 const AI_RATE_WINDOW_MS = 60 * 60 * 1000;
 const AI_RATE_MAX = parseInt(process.env.AI_RATE_MAX, 10) || 30;
 const AI_MAX_QUESTIONS = 40;
@@ -239,9 +242,26 @@ function aiSchema(schema) {
   return schema;
 }
 
-async function aiGenerate({ systemInstruction, userMessage, schema }) {
-  if (!GEMINI_API_KEY) throw Object.assign(new Error('GEMINI_API_KEY not configured'), { code: 503 });
+function aiRetryableStatus(status) {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
 
+function aiTransientNetworkError(e) {
+  if (!e) return false;
+  if (e.name === 'TimeoutError' || e.name === 'AbortError') return true;
+  const code = e.code || (e.cause && e.cause.code) || '';
+  return ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'UND_ERR_SOCKET'].includes(code);
+}
+
+function aiOverloadMessage(msg) {
+  if (!msg) return false;
+  const m = String(msg).toLowerCase();
+  return m.includes('high demand') || m.includes('try again later') || m.includes('overloaded')
+    || m.includes('resource_exhausted') || m.includes('unavailable') || m.includes('service unavailable');
+}
+
+// Один виклик Gemini. Кидає помилку з .status / .retryable / .code.
+async function aiGenerateOnce({ systemInstruction, userMessage, schema }, { action, deadlineAt }) {
   const generationConfig = {
     responseMimeType: 'application/json',
     responseSchema: aiSchema(schema),
@@ -258,34 +278,116 @@ async function aiGenerate({ systemInstruction, userMessage, schema }) {
   };
 
   const url = `${GEMINI_API_BASE}/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(AI_TIMEOUT_MS),
-  });
+  const remaining = deadlineAt ? deadlineAt - Date.now() : AI_TIMEOUT_MS;
+  const timeoutMs = Math.max(5000, Math.min(AI_TIMEOUT_MS, remaining));
+  const started = Date.now();
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    const err = new Error(`Gemini API: ${e.name === 'TimeoutError' ? 'таймаут запиту' : (e.message || 'мережева помилка')}`);
+    err.status = 0;
+    err.code = 502;
+    err.retryable = true;
+    err.nativeName = e.name;
+    err.nativeCode = e.code || (e.cause && e.cause.code) || '';
+    console.log(`[AI] ${action} network error in ${Date.now() - started}ms: ${err.nativeName || ''} ${err.nativeCode || ''} ${err.message}`);
+    throw err;
+  }
 
   const text = await res.text();
   let data = null;
-  try { data = JSON.parse(text); } catch { /* ignore */ }
+  try { data = JSON.parse(text); } catch { /* не-JSON */ }
+
+  const usage = (data && data.usageMetadata) || null;
+  const candidate = (data && data.candidates && data.candidates[0]) || null;
+  const finish = (candidate && candidate.finishReason) || '';
+  const usageStr = usage
+    ? `tokens=${usage.promptTokenCount || 0}/${usage.candidatesTokenCount || 0}${usage.thoughtsTokenCount ? ' thoughts=' + usage.thoughtsTokenCount : ''}`
+    : 'tokens=-';
 
   if (!res.ok) {
     const msg = (data && data.error && data.error.message) ? data.error.message : `HTTP ${res.status}`;
+    const gcode = (data && data.error && data.error.status) || '';
     const err = new Error(`Gemini API: ${msg}`);
+    err.status = res.status;
     err.code = res.status === 429 ? 429 : 502;
+    err.retryable = aiRetryableStatus(res.status);
+    err.googleCode = gcode;
+    const retryAfter = parseInt(res.headers.get('retry-after') || '', 10);
+    if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfterMs = Math.min(retryAfter, 30) * 1000;
+    console.log(`[AI] ${action} http ${res.status}${gcode ? ' ' + gcode : ''} ${usageStr} ${Date.now() - started}ms: ${msg}`);
     throw err;
   }
 
-  const parts = (data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
-  const out = parts.map(p => (p && p.text) || '').join('');
+  const out = ((candidate && candidate.content && candidate.content.parts) || [])
+    .map(p => (p && p.text) || '').join('');
+
   if (!out.trim()) {
-    const finish = data && data.candidates && data.candidates[0] && data.candidates[0].finishReason;
     const blocked = data && data.promptFeedback && data.promptFeedback.blockReason;
+    console.log(`[AI] ${action} empty output finish=${finish || '-'} blocked=${blocked || '-'} ${usageStr} ${Date.now() - started}ms`);
     const err = new Error(`Порожня відповідь AI${blocked ? ` (blocked: ${blocked})` : ''}${finish ? ` (finishReason: ${finish})` : ''}`);
     err.code = 502;
+    err.retryable = false;
     throw err;
   }
+
+  console.log(`[AI] ${action} ok finish=${finish || '-'} ${usageStr} out=${Buffer.byteLength(out, 'utf8')}B ${Date.now() - started}ms`);
   return out;
+}
+
+// Ретраї транзієнтних помилок (429/5xx, мережа, таймаут) у межах дедлайну.
+async function aiGenerate(request, opts = {}) {
+  const action = opts.action || 'generate';
+  const deadlineMs = opts.deadlineMs || AI_DEADLINE_MS;
+  if (!GEMINI_API_KEY) throw Object.assign(new Error('GEMINI_API_KEY not configured'), { code: 503 });
+
+  const deadlineAt = Date.now() + deadlineMs;
+  let lastErr = null;
+  let stoppedByDeadline = false;
+
+  for (let attempt = 0; attempt <= AI_RETRY_DELAYS_MS.length; attempt++) {
+    if (attempt > 0) {
+      const budget = deadlineAt - Date.now();
+      const wait = Math.min(AI_RETRY_DELAYS_MS[attempt - 1] + Math.floor(Math.random() * 400), budget);
+      if (wait <= 0) { stoppedByDeadline = true; break; }
+      console.log(`[AI] retry ${attempt}/${AI_RETRY_DELAYS_MS.length} for ${action} in ${wait}ms after: ${lastErr ? lastErr.message : ''}`);
+      await sleep(wait);
+      if (Date.now() >= deadlineAt) { stoppedByDeadline = true; break; }
+    }
+
+    try {
+      return await aiGenerateOnce(request, { action, deadlineAt });
+    } catch (e) {
+      lastErr = e;
+      const transient = (e && e.retryable) || aiRetryableStatus(e && e.status) || aiTransientNetworkError(e);
+      if (!transient) break;
+      if (Date.now() >= deadlineAt) { stoppedByDeadline = true; break; }
+      if (attempt === AI_RETRY_DELAYS_MS.length) break;
+    }
+  }
+
+  const err = lastErr || new Error('AI недоступний');
+  const transient = (err && err.retryable) || aiRetryableStatus(err && err.status) || aiTransientNetworkError(err);
+  const overloaded = aiRetryableStatus(err.status) && err.status !== 500 && err.status !== 502 && err.status !== 504
+    || aiOverloadMessage(err.message);
+
+  if (transient) {
+    const msg = overloaded
+      ? 'AI тимчасово перевантажено (пікове навантаження). Спробуйте за 1–2 хвилини.'
+      : 'AI тривалий час не відповідає. Спробуйте ще раз за хвилину.';
+    const out = Object.assign(new Error(msg), { code: 503, retryAfterSec: 15, cause: err.message });
+    console.log(`[AI] ${action} giving up${stoppedByDeadline ? ' (deadline)' : ' (retries exhausted)'}: status=${err.status || 0} ${err.message}`);
+    throw out;
+  }
+
+  throw err;
 }
 
 function aiParseJsonLoose(text) {
@@ -544,31 +646,37 @@ function aiValidateQuestions(result, meta) {
   const raw = result && Array.isArray(result.questions) ? result.questions : [];
   const allowedTypes = AI_QUESTION_SCHEMA.properties.type.enum;
   const questions = [];
+  const rejected = {};
+  let sample = null;
+  const drop = (reason, q) => {
+    rejected[reason] = (rejected[reason] || 0) + 1;
+    if (!sample && q && typeof q === 'object') sample = q;
+  };
   for (const q of raw) {
-    if (!q || typeof q !== 'object') continue;
+    if (!q || typeof q !== 'object') { drop('not_object', null); continue; }
     const type = allowedTypes.includes(q.type) ? q.type : null;
     const prompt = aiStr(q.prompt, 4000);
-    if (!type || !prompt) continue;
+    if (!type || !prompt) { drop(type ? 'no_prompt' : 'type_invalid', q); continue; }
     const out = { type, prompt, points: aiInt(q.points, 1, 100, 1) };
 
     if (type === 'single' || type === 'multiple') {
       const options = (Array.isArray(q.options) ? q.options : []).map(o => aiStr(o, 1000)).filter(Boolean).slice(0, 8);
-      if (options.length < 2) continue;
+      if (options.length < 2) { drop('options_lt2', q); continue; }
       let correct = (Array.isArray(q.correctIndexes) ? q.correctIndexes : [])
         .map(n => parseInt(n, 10)).filter(n => Number.isInteger(n) && n >= 0 && n < options.length);
       correct = Array.from(new Set(correct)).sort((a, b) => a - b);
-      if (!correct.length) continue;
+      if (!correct.length) { drop('no_correct', q); continue; }
       if (type === 'single' && correct.length > 1) correct = [correct[0]];
-      if (type === 'multiple' && correct.length < 2) continue;
+      if (type === 'multiple' && correct.length < 2) { drop('multiple_lt2', q); continue; }
       out.options = options;
       out.correctIndexes = correct;
     } else if (type === 'short') {
       const acc = (Array.isArray(q.acceptedAnswers) ? q.acceptedAnswers : []).map(a => aiStr(a, 300)).filter(Boolean).slice(0, 5);
-      if (!acc.length) continue;
+      if (!acc.length) { drop('no_accepted', q); continue; }
       out.acceptedAnswers = acc;
     } else if (type === 'ordering') {
       const items = (Array.isArray(q.items) ? q.items : []).map(i => aiStr(i, 500)).filter(Boolean).slice(0, 8);
-      if (items.length < 2) continue;
+      if (items.length < 2) { drop('items_lt2', q); continue; }
       let order = (Array.isArray(q.correctOrder) ? q.correctOrder : []).map(n => parseInt(n, 10))
         .filter(n => Number.isInteger(n) && n >= 0 && n < items.length);
       order = Array.from(new Set(order));
@@ -580,7 +688,7 @@ function aiValidateQuestions(result, meta) {
         .filter(pr => pr && typeof pr === 'object')
         .map(pr => ({ left: aiStr(pr.left, 500), right: aiStr(pr.right, 500) }))
         .filter(pr => pr.left && pr.right).slice(0, 8);
-      if (pairs.length < 2) continue;
+      if (pairs.length < 2) { drop('pairs_lt2', q); continue; }
       out.pairs = pairs;
     }
 
@@ -595,6 +703,17 @@ function aiValidateQuestions(result, meta) {
     questions.push(out);
     if (questions.length >= (meta && meta.count ? meta.count : AI_MAX_QUESTIONS)) break;
   }
+
+  const stats = [`questions raw=${raw.length} kept=${questions.length}`];
+  if (Object.keys(rejected).length) stats.push(`rejected=${JSON.stringify(rejected)}`);
+  if (sample) {
+    stats.push(`sample=${JSON.stringify({
+      type: typeof sample.type === 'string' ? sample.type : String(sample.type),
+      keys: Object.keys(sample).slice(0, 12),
+      prompt: String(sample.prompt || '').slice(0, 150),
+    })}`);
+  }
+  console.log(`[AI] ${stats.join(' ')}`);
   return questions;
 }
 
@@ -663,7 +782,10 @@ async function handleAiRequest(req, res) {
   const started = Date.now();
   let raw;
   try {
-    raw = await aiGenerate(request);
+    raw = await aiGenerate(request, {
+      action,
+      deadlineMs: action === 'grade_answer' ? AI_DEADLINE_GRADE_MS : AI_DEADLINE_MS,
+    });
   } catch (e) {
     console.error(`[AI] ${action} failed after ${Date.now() - started}ms:`, e.message);
     return send(e.code || 502, { ok: false, error: e.message || 'AI недоступний' });
@@ -671,7 +793,7 @@ async function handleAiRequest(req, res) {
 
   const parsed = aiParseJsonLoose(raw);
   if (!parsed) {
-    console.error(`[AI] ${action}: JSON parse failed, raw length=${raw.length}`);
+    console.log(`[AI] ${action}: JSON parse failed, raw length=${raw.length} head=${JSON.stringify(raw.slice(0, 200))} tail=${JSON.stringify(raw.slice(-120))}`);
     return send(502, { ok: false, error: 'AI повернув некоректну відповідь. Спробуйте ще раз.' });
   }
 
