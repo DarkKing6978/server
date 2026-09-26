@@ -505,8 +505,17 @@ function aiParseJsonLoose(text) {
 // "questions", решту (незавершену) відкидаємо.
 function aiSalvageQuestions(text) {
   if (!text) return null;
-  const m = /"questions"\s*:\s*\[/.exec(text);
-  if (!m) return null;
+  let scanFrom = -1;
+  const m = /"(?:questions|items|data|quiz|list)"\s*:\s*\[/.exec(text);
+  if (m) {
+    scanFrom = m.index + m[0].length;
+  } else {
+    // Відповідь-масив без обгортки: перший верхній '[' (обгортаючий об'єкт
+    // уже відкинуто — парсер не зміг добудувати JSON).
+    const first = text.indexOf('[');
+    if (first !== -1) scanFrom = first + 1;
+  }
+  if (scanFrom === -1) return null;
   const grabStr = (key) => {
     const re = new RegExp('"' + key + '"\\s*:\\s*("(?:[^"\\\\]|\\\\.)*")');
     const mm = re.exec(text);
@@ -515,7 +524,7 @@ function aiSalvageQuestions(text) {
   };
   const items = [];
   let depth = 0, inStr = false, esc = false, start = -1;
-  for (let i = m.index + m[0].length; i < text.length; i++) {
+  for (let i = scanFrom; i < text.length; i++) {
     const c = text[i];
     if (inStr) {
       if (esc) esc = false;
@@ -563,7 +572,7 @@ const AI_QUESTION_SCHEMA = {
   properties: {
     type: { type: 'STRING', enum: ['single', 'multiple', 'short', 'long', 'ordering', 'matching'] },
     prompt: { type: 'STRING' },
-    points: { type: 'INTEGER', minimum: 1, maximum: 1000000 },
+    points: { type: 'INTEGER', minimum: 1, maximum: 1000 },
     options: { type: 'ARRAY', items: { type: 'STRING' } },
     correctIndexes: { type: 'ARRAY', items: { type: 'INTEGER' } },
     acceptedAnswers: { type: 'ARRAY', items: { type: 'STRING' } },
@@ -599,6 +608,66 @@ const AI_QUESTIONS_SCHEMA = {
   properties: { questions: { type: 'ARRAY', items: AI_QUESTION_SCHEMA } },
   required: ['questions'],
 };
+
+// Динамічна схема питань: required залежить від запитаних типів, щоб модель
+// НЕ могла віддати мінімальний JSON (лише type/prompt/points): при structured
+// output модель вважає схему істиною, тому обов'язковість полів відповіді
+// (options/acceptedAnswers/…) має бути зафіксована саме в схемі.
+//  - одна сімʼя типів → поля відповіді required БЕЗ nullable;
+//  - мішані сімʼї → required З nullable: ключ зобов'язаний існувати,
+//    null допускається лише як значення (для чужої сімʼї типів).
+// Масиви свідомо БЕЗ minItems/maxItems — не ризикуємо 400 від Google
+// (рівно 4 варіанти контролює промпт, валідація приймає ≥2).
+function aiBuildQuestionsSchema({ types, fullTest, withExplanations, withModelAnswers }) {
+  const allTypes = AI_QUESTION_SCHEMA.properties.type.enum;
+  const useTypes = (Array.isArray(types) ? types : []).filter(t => allTypes.includes(t));
+  const effective = useTypes.length ? useTypes : allTypes;
+
+  const fieldsByType = {
+    single: ['options', 'correctIndexes'],
+    multiple: ['options', 'correctIndexes'],
+    short: ['acceptedAnswers'],
+    ordering: ['items', 'correctOrder'],
+    matching: ['pairs'],
+    long: withModelAnswers ? ['modelAnswer'] : [],
+  };
+  // Сімʼї: single/multiple — одна (choice), решта — свої.
+  const family = (t) => (t === 'single' || t === 'multiple' ? 'choice' : t);
+  const mixed = new Set(effective.map(family)).size > 1;
+  const typeFields = [...new Set(effective.flatMap(t => fieldsByType[t] || []))];
+
+  const props = {
+    type: { type: 'STRING', enum: effective },
+    prompt: { type: 'STRING' },
+    points: { type: 'INTEGER', minimum: 1, maximum: 1000 },
+  };
+  const required = ['type', 'prompt', 'points'];
+  for (const f of typeFields) {
+    const base = JSON.parse(JSON.stringify(AI_QUESTION_SCHEMA.properties[f]));
+    if (mixed) base.nullable = true;
+    props[f] = base;
+    required.push(f);
+  }
+  if (withExplanations) {
+    props.explanation = { type: 'STRING' };
+    required.push('explanation');
+  }
+
+  const items = { type: 'OBJECT', properties: props, required };
+  if (fullTest) {
+    return {
+      type: 'OBJECT',
+      properties: {
+        title: { type: 'STRING' },
+        subtitle: { type: 'STRING' },
+        topics: { type: 'ARRAY', items: { type: 'STRING' } },
+        questions: { type: 'ARRAY', items },
+      },
+      required: ['title', 'questions'],
+    };
+  }
+  return { type: 'OBJECT', properties: { questions: { type: 'ARRAY', items } }, required: ['questions'] };
+}
 
 const AI_EXPLANATIONS_SCHEMA = {
   type: 'OBJECT',
@@ -713,7 +782,7 @@ function aiBuildQuestionsRequest(p, { fullTest }) {
   return {
     systemInstruction: AI_SYSTEM_INSTRUCTION,
     userMessage: msg,
-    schema: fullTest ? AI_TEST_SCHEMA : AI_QUESTIONS_SCHEMA,
+    schema: aiBuildQuestionsSchema({ types, fullTest, withExplanations, withModelAnswers }),
     meta: { count, withExplanations, withModelAnswers, types },
   };
 }
@@ -818,8 +887,19 @@ function aiBuildCorrectiveRequest(request, prevRaw, feedback) {
 }
 
 // ── AI: валідація результату від моделі ─────────────────────────────────────
+// Максимальне витягування: модель може віддати масив не лише під ключем
+// "questions", а й під "items"/"data"/"quiz"/"list" або взагалі без обгортки.
+function aiExtractQuestionsArray(result) {
+  if (Array.isArray(result)) return result;
+  if (!result || typeof result !== 'object') return [];
+  for (const k of ['questions', 'items', 'data', 'quiz', 'list']) {
+    if (Array.isArray(result[k])) return result[k];
+  }
+  return [];
+}
+
 function aiValidateQuestions(result, meta) {
-  const raw = result && Array.isArray(result.questions) ? result.questions : [];
+  const raw = aiExtractQuestionsArray(result);
   const allowedTypes = AI_QUESTION_SCHEMA.properties.type.enum;
   const questions = [];
   const rejected = {};
@@ -1030,6 +1110,14 @@ async function handleAiRequest(req, res) {
   }
   aiDebug('prompt head', JSON.stringify(request.userMessage.slice(0, 600)));
   aiDebug('schema', Object.keys((request.schema && request.schema.properties) || {}), 'meta', JSON.stringify(request.meta || {}));
+  if (action === 'generate_questions' || action === 'generate_full_test') {
+    const items = request.schema && request.schema.properties && request.schema.properties.questions
+      && request.schema.properties.questions.items;
+    if (items && Array.isArray(items.required)) {
+      const nullable = Object.keys(items.properties || {}).filter(k => items.properties[k] && items.properties[k].nullable);
+      aiDebug('schema required', JSON.stringify(items.required), 'nullable', JSON.stringify(nullable));
+    }
+  }
 
   // 4) Виклик Gemini.
   const started = Date.now();
@@ -1085,6 +1173,8 @@ async function handleAiRequest(req, res) {
   };
 
   let parsed = aiParseJsonLoose(raw);
+  // Максимальне витягування: відповідь-масив без обгортки {"questions": [...]}.
+  if (parsed && wantsQuestions && Array.isArray(parsed)) parsed = { questions: parsed };
   if (!parsed && wantsQuestions) {
     // Обрізана відповідь (дегенеративне число в "points", ліміт токенів) →
     // відновлюємо принаймні повні питання з масиву.
