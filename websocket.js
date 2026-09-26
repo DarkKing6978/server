@@ -122,6 +122,8 @@ const AI_DEADLINE_GRADE_MS = 80000;          // grade_answer (клієнт че�
 const AI_RETRY_DELAYS_MS = [1000, 3000, 7000];
 const AI_RATE_WINDOW_MS = 60 * 60 * 1000;
 const AI_RATE_MAX = parseInt(process.env.AI_RATE_MAX, 10) || 30;
+// Вчитель з власним ключем (BYOK) сплачує квоту сам → вищий ліміт.
+const AI_RATE_MAX_OWN = parseInt(process.env.AI_RATE_MAX_OWN, 10) || 300;
 const AI_MAX_QUESTIONS = 40;
 const AI_MAX_SLIDES = 30;
 const AI_MAX_TEXT = 6000;
@@ -167,17 +169,22 @@ function aiReadBody(req, limit) {
 }
 
 // ── AI: rate limit (in-memory, на користувача) ──────────────────────────────
-function aiRateCheck(userId) {
+// limit визначає джерело ключа: власний ключ (BYOK) → AI_RATE_MAX_OWN,
+// платформний → AI_RATE_MAX. Ліміт у записі оновлюється при кожному виклику,
+// щоб зміна ключа вчителям підхоплювалась одразу.
+function aiRateCheck(userId, limit) {
+  const max = Number.isFinite(limit) && limit > 0 ? limit : AI_RATE_MAX;
   const now = Date.now();
   const rec = _aiRate.get(userId);
   if (!rec || rec.resetAt <= now) {
-    _aiRate.set(userId, { count: 1, resetAt: now + AI_RATE_WINDOW_MS });
+    _aiRate.set(userId, { count: 1, resetAt: now + AI_RATE_WINDOW_MS, max });
     if (_aiRate.size > 2000) {
       for (const [k, v] of _aiRate) { if (v.resetAt <= now) _aiRate.delete(k); }
     }
     return { ok: true };
   }
-  if (rec.count >= AI_RATE_MAX) return { ok: false, resetAt: rec.resetAt };
+  rec.max = max;
+  if (rec.count >= max) return { ok: false, resetAt: rec.resetAt };
   rec.count += 1;
   return { ok: true };
 }
@@ -212,7 +219,10 @@ async function aiResolveUser(req) {
   const userId = req.headers['x-sm-user'];
   if (!token || !userId) return null;
 
-  const cacheKey = crypto.createHash('sha256').update(`${userId}:${token}`).digest('hex');
+  // X-SM-Key-Rev — клієнтська ревізія ключа (оновлюється після збереження
+  // власного ключа вчителем): дозволяє одразу скинути кеш me.php, не чекаючи 60с.
+  const keyRev = String(req.headers['x-sm-key-rev'] || '');
+  const cacheKey = crypto.createHash('sha256').update(`${userId}:${token}:${keyRev}`).digest('hex');
   const hit = _meCache.get(cacheKey);
   if (hit && hit.exp > Date.now()) return hit.user;
   if (_meCache.size > 1000) {
@@ -231,7 +241,13 @@ async function aiResolveUser(req) {
 
   const { status, json } = await aiFetchJson(url, opts);
   if (status !== 200 || !json || !json.ok || !json.user) return null;
-  const user = { id: String(json.user.id || userId), role: json.user.role || 'student', status: json.user.status || '' };
+  const user = {
+    id: String(json.user.id || userId),
+    role: json.user.role || 'student',
+    status: json.user.status || '',
+    // Власний Gemini-ключ вчителя (BYOK), якщо заданий; '' → ключ платформи.
+    aiApiKey: typeof json.user.aiApiKey === 'string' ? json.user.aiApiKey.trim() : '',
+  };
   _meCache.set(cacheKey, { user, exp: Date.now() + 60000 });
   return user;
 }
@@ -261,7 +277,8 @@ function aiOverloadMessage(msg) {
 }
 
 // Один виклик Gemini. Кидає помилку з .status / .retryable / .code.
-async function aiGenerateOnce({ systemInstruction, userMessage, schema }, { action, deadlineAt }) {
+// opts.apiKey — ключ конкретного запиту (власний ключ вчителя або платформенний).
+async function aiGenerateOnce({ systemInstruction, userMessage, schema }, { action, deadlineAt, apiKey }) {
   const generationConfig = {
     responseMimeType: 'application/json',
     responseSchema: aiSchema(schema),
@@ -278,6 +295,7 @@ async function aiGenerateOnce({ systemInstruction, userMessage, schema }, { acti
   };
 
   const url = `${GEMINI_API_BASE}/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const key = String(apiKey || '').trim() || GEMINI_API_KEY;
   const remaining = deadlineAt ? deadlineAt - Date.now() : AI_TIMEOUT_MS;
   const timeoutMs = Math.max(5000, Math.min(AI_TIMEOUT_MS, remaining));
   const started = Date.now();
@@ -286,7 +304,7 @@ async function aiGenerateOnce({ systemInstruction, userMessage, schema }, { acti
   try {
     res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -344,10 +362,17 @@ async function aiGenerateOnce({ systemInstruction, userMessage, schema }, { acti
 }
 
 // Ретраї транзієнтних помилок (429/5xx, мережа, таймаут) у межах дедлайну.
+// opts.apiKey — ключ цього запиту (власний вчителя або платформенний).
 async function aiGenerate(request, opts = {}) {
   const action = opts.action || 'generate';
   const deadlineMs = opts.deadlineMs || AI_DEADLINE_MS;
-  if (!GEMINI_API_KEY) throw Object.assign(new Error('GEMINI_API_KEY not configured'), { code: 503 });
+  const apiKey = String(opts.apiKey || '').trim();
+  if (!apiKey && !GEMINI_API_KEY) {
+    throw Object.assign(
+      new Error('AI ще не налаштовано: додайте свій Gemini-ключ у профілі (⚙️ Профіль → AI-ключ) або задайте GEMINI_API_KEY у сервісі Render.'),
+      { code: 503 }
+    );
+  }
 
   const deadlineAt = Date.now() + deadlineMs;
   let lastErr = null;
@@ -364,7 +389,7 @@ async function aiGenerate(request, opts = {}) {
     }
 
     try {
-      return await aiGenerateOnce(request, { action, deadlineAt });
+      return await aiGenerateOnce(request, { action, deadlineAt, apiKey });
     } catch (e) {
       lastErr = e;
       const transient = (e && e.retryable) || aiRetryableStatus(e && e.status) || aiTransientNetworkError(e);
@@ -715,7 +740,26 @@ function aiValidateQuestions(result, meta) {
     })}`);
   }
   console.log(`[AI] ${stats.join(' ')}`);
-  return questions;
+  return { questions, rawCount: raw.length, rejected };
+}
+
+// Причини відсіву питань — українською для повідомлення в UI.
+const AI_REJECT_REASON_UA = {
+  not_object: 'необ’єкт',
+  type_invalid: 'невалідний тип',
+  no_prompt: 'порожній текст запитання',
+  options_lt2: 'менше 2 варіантів',
+  no_correct: 'нема правильної відповіді',
+  multiple_lt2: 'для multiple <2 правильних',
+  no_accepted: 'нема прийнятих відповідей',
+  items_lt2: 'менше 2 елементів',
+  pairs_lt2: 'менше 2 пар',
+};
+
+function aiRejectionSummary(rejected) {
+  return Object.entries(rejected || {})
+    .map(([k, n]) => `${AI_REJECT_REASON_UA[k] || k}: ${n}`)
+    .join(', ');
 }
 
 // ── AI: головний обробник POST /ai ──────────────────────────────────────────
@@ -726,7 +770,9 @@ async function handleAiRequest(req, res) {
     res.end(JSON.stringify(obj));
   };
 
-  if (!GEMINI_API_KEY) return send(503, { ok: false, error: 'AI ще не налаштовано: додайте GEMINI_API_KEY у сервісі Render.' });
+  // Примітка: GEMINI_API_KEY (платформний) може бути не заданий — тоді
+  // виручить власний ключ вчителя (BYOK); перевірка «чи є хоч якийсь ключ»
+  // виконується після розв'язання користувача (нижче).
 
   let bodyText;
   try {
@@ -759,8 +805,15 @@ async function handleAiRequest(req, res) {
     return send(403, { ok: false, error: 'Акаунт вчителя ще не активовано' });
   }
 
-  // 2) Rate limit.
-  const rl = aiRateCheck(user.id);
+  // 2) Ключ: власний вчительський (BYOK) → платформений; rate limit під нього.
+  const ownKey = String(user.aiApiKey || '').trim();
+  const apiKey = ownKey || GEMINI_API_KEY;
+  const keySource = ownKey ? 'own' : 'platform';
+  if (!apiKey) {
+    return send(503, { ok: false, error: 'AI ще не налаштовано: додайте свій Gemini-ключ у профілі (⚙️ Профіль → AI-ключ) або задайте ключ платформи.' });
+  }
+
+  const rl = aiRateCheck(user.id, ownKey ? AI_RATE_MAX_OWN : AI_RATE_MAX);
   if (!rl.ok) {
     const mins = Math.max(1, Math.ceil((rl.resetAt - Date.now()) / 60000));
     return send(429, { ok: false, error: `Забагато AI-запитів. Спробуйте за ${mins} хв.` });
@@ -781,10 +834,12 @@ async function handleAiRequest(req, res) {
 
   // 4) Виклик Gemini.
   const started = Date.now();
+  console.log(`[AI] ${action} for ${user.id} (${role}) key=${keySource}`);
   let raw;
   try {
     raw = await aiGenerate(request, {
       action,
+      apiKey,
       deadlineMs: action === 'grade_answer' ? AI_DEADLINE_GRADE_MS : AI_DEADLINE_MS,
     });
   } catch (e) {
@@ -802,13 +857,18 @@ async function handleAiRequest(req, res) {
   let result;
   try {
     if (action === 'generate_questions' || action === 'generate_full_test') {
-      const questions = aiValidateQuestions(parsed, request.meta);
-      if (!questions.length) throw Object.assign(new Error('AI не зміг згенерувати валідні запитання. Спробуйте змінити параметри.'), { code: 502 });
+      const v = aiValidateQuestions(parsed, request.meta);
+      if (!v.questions.length) {
+        const detail = v.rawCount
+          ? `AI повернув ${v.rawCount} запитань, жодне не пройшло фільтр (${aiRejectionSummary(v.rejected)})`
+          : 'AI повернув порожній список запитань';
+        throw Object.assign(new Error(`${detail}. Спробуйте ще раз або змініть параметри.`), { code: 502 });
+      }
       result = {
         title: aiStr(parsed.title, 200),
         subtitle: aiStr(parsed.subtitle, 300),
         topics: aiStrList(parsed.topics, 6, 60),
-        questions,
+        questions: v.questions,
       };
     } else if (action === 'generate_explanations') {
       const list = Array.isArray(parsed.explanations) ? parsed.explanations : [];
@@ -839,8 +899,8 @@ async function handleAiRequest(req, res) {
     return send(e.code || 502, { ok: false, error: e.message || 'AI повернув некоректні дані' });
   }
 
-  console.log(`[AI] ${action} ok for ${user.id} (${role}) in ${Date.now() - started}ms`);
-  send(200, { ok: true, action, model: GEMINI_MODEL, result });
+  console.log(`[AI] ${action} ok for ${user.id} (${role}) key=${keySource} in ${Date.now() - started}ms`);
+  send(200, { ok: true, action, model: GEMINI_MODEL, key: keySource, result });
 }
 
 // ── Answer Buffer ──────────────────────────────────────────────────────────
@@ -978,7 +1038,7 @@ const participantCurrentQuestion = new Map(); // `${sessionId}:${participantId}`
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-SM-Auth, X-SM-User');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-SM-Auth, X-SM-User, X-SM-Key-Rev');
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
