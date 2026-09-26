@@ -553,7 +553,13 @@ function aiQuestionSpec({ withExplanations, withModelAnswers }) {
   if (withExplanations) {
     s += '- "explanation": пояснення для учня (2-4 речення): чому відповідь правильна і типова помилка.\n';
   }
-  s += 'Варіанти відповідей мають бути правдоподібними (один явно правильний, решта — типові помилки), без \'усі з вищевказаних\'.';
+  s += 'ВАЖЛИВО:\n' +
+    '1) Індекси в "correctIndexes"/"correctOrder" — ЗАВЖДИ починаючи з 0 (перший варіант = 0), ніколи з 1.\n' +
+    '2) Поля правильної відповіді обов\'язкові для кожного типу: single/multiple → "correctIndexes", ' +
+    'short → "acceptedAnswers", ordering → "correctOrder", matching → "pairs". ' +
+    'Якщо не можеш вказати правильну відповідь — не генеруй це питання, а візьми інше.\n' +
+    '3) Варіанти відповідей мають бути правдоподібними (один явно правильний, решта — типові помилки), ' +
+    'без \'усі з вищевказаних\'.';
   return s;
 }
 
@@ -573,7 +579,7 @@ function aiBuildQuestionsRequest(p, { fullTest }) {
     `Клас/рівень: ${grade || 'невідомо'}\n` +
     `Складність: ${difficulty}\n` +
     `Мова: ${language}\n` +
-    `Кількість запитань: ${count}\n` +
+    `Кількість запитань: ${count} — поверни у масиві "questions" РОВНО стільки питань (кожне з правильною відповіддю)\n` +
     `Дозволені типи запитань: ${(types.length ? types : AI_QUESTION_SCHEMA.properties.type.enum).join(', ')}\n` +
     (customTitle ? `Заголовок тесту: ${customTitle}\n` : '') +
     `\n${aiQuestionSpec({ withExplanations, withModelAnswers })}\n`;
@@ -688,8 +694,27 @@ function aiValidateQuestions(result, meta) {
     if (type === 'single' || type === 'multiple') {
       const options = (Array.isArray(q.options) ? q.options : []).map(o => aiStr(o, 1000)).filter(Boolean).slice(0, 8);
       if (options.length < 2) { drop('options_lt2', q); continue; }
-      let correct = (Array.isArray(q.correctIndexes) ? q.correctIndexes : [])
-        .map(n => parseInt(n, 10)).filter(n => Number.isInteger(n) && n >= 0 && n < options.length);
+
+      // Толерантне читання правильної відповіді: масив "correctIndexes",
+      // одиночний "correctIndex" або "correct" (модель віддає їх по-різному).
+      let rawIdx = Array.isArray(q.correctIndexes) ? q.correctIndexes
+        : (Array.isArray(q.correct) ? q.correct
+          : (q.correctIndex !== undefined && q.correctIndex !== null ? [q.correctIndex] : []));
+      rawIdx = rawIdx.map(n => parseInt(n, 10)).filter(n => Number.isInteger(n));
+      let correct = rawIdx.filter(n => n >= 0 && n < options.length);
+      // Модель часто рахує індекси З 1 (тоді max === options.length, всі ≥ 1) → зсуваємо на -1.
+      if (!correct.length && rawIdx.length && rawIdx.every(n => n >= 1)) {
+        correct = rawIdx.map(n => n - 1).filter(n => n >= 0 && n < options.length);
+      }
+      // Текстова правильна відповідь → шукаємо збіг із варіантами.
+      if (!correct.length) {
+        const answerText = aiStr(q.correctAnswer || q.answer, 1000);
+        if (answerText) {
+          const norm = (t) => String(t || '').trim().toLowerCase().replace(/\s+/g, ' ');
+          const idx = options.findIndex(o => norm(o) === norm(answerText));
+          if (idx >= 0) correct = [idx];
+        }
+      }
       correct = Array.from(new Set(correct)).sort((a, b) => a - b);
       if (!correct.length) { drop('no_correct', q); continue; }
       if (type === 'single' && correct.length > 1) correct = [correct[0]];
@@ -697,7 +722,14 @@ function aiValidateQuestions(result, meta) {
       out.options = options;
       out.correctIndexes = correct;
     } else if (type === 'short') {
-      const acc = (Array.isArray(q.acceptedAnswers) ? q.acceptedAnswers : []).map(a => aiStr(a, 300)).filter(Boolean).slice(0, 5);
+      let acc = (Array.isArray(q.acceptedAnswers) ? q.acceptedAnswers : []).map(a => aiStr(a, 300)).filter(Boolean);
+      if (!acc.length) {
+        // Толерантність: одна прийнятна відповідь може прийти під іншими полями.
+        const alt = (q.answer !== undefined && q.answer !== null) ? q.answer
+          : ((q.accepted !== undefined && q.accepted !== null) ? q.accepted : q.correctAnswer);
+        acc = (Array.isArray(alt) ? alt : [alt]).map(a => aiStr(a, 300)).filter(Boolean);
+      }
+      acc = acc.slice(0, 5);
       if (!acc.length) { drop('no_accepted', q); continue; }
       out.acceptedAnswers = acc;
     } else if (type === 'ordering') {
@@ -760,6 +792,15 @@ function aiRejectionSummary(rejected) {
   return Object.entries(rejected || {})
     .map(([k, n]) => `${AI_REJECT_REASON_UA[k] || k}: ${n}`)
     .join(', ');
+}
+
+// Українська плюралізація: 1 запитання / 2 запитання / 5 запитань.
+function aiPlural(n, one, few, many) {
+  const n10 = n % 10;
+  const n100 = n % 100;
+  if (n10 === 1 && n100 !== 11) return one;
+  if (n10 >= 2 && n10 <= 4 && (n100 < 12 || n100 > 14)) return few;
+  return many;
 }
 
 // ── AI: головний обробник POST /ai ──────────────────────────────────────────
@@ -860,7 +901,7 @@ async function handleAiRequest(req, res) {
       const v = aiValidateQuestions(parsed, request.meta);
       if (!v.questions.length) {
         const detail = v.rawCount
-          ? `AI повернув ${v.rawCount} запитань, жодне не пройшло фільтр (${aiRejectionSummary(v.rejected)})`
+          ? `AI повернув ${v.rawCount} ${aiPlural(v.rawCount, 'запитання', 'запитання', 'запитань')}, жодне не пройшло фільтр (${aiRejectionSummary(v.rejected)})`
           : 'AI повернув порожній список запитань';
         throw Object.assign(new Error(`${detail}. Спробуйте ще раз або змініть параметри.`), { code: 502 });
       }
