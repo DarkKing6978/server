@@ -322,6 +322,7 @@ async function aiGenerateOnce({ systemInstruction, userMessage, schema }, { acti
     err.googleCode = gcode;
     const retryAfter = parseInt(res.headers.get('retry-after') || '', 10);
     if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfterMs = Math.min(retryAfter, 30) * 1000;
+
     console.log(`[AI] ${action} http ${res.status}${gcode ? ' ' + gcode : ''} ${usageStr} ${Date.now() - started}ms: ${msg}`);
     throw err;
   }
