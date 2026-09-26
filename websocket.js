@@ -500,6 +500,47 @@ function aiParseJsonLoose(text) {
   try { return JSON.parse(text.slice(s, end + 1)); } catch { return null; }
 }
 
+// Відновлення з ОБРІЗАНОЇ відповіді (модель згенерувала дегенеративне число /
+// упиралася в ліміт токенів): витягуємо лише ПОВНІ об'єкти питань із масиву
+// "questions", решту (незавершену) відкидаємо.
+function aiSalvageQuestions(text) {
+  if (!text) return null;
+  const m = /"questions"\s*:\s*\[/.exec(text);
+  if (!m) return null;
+  const grabStr = (key) => {
+    const re = new RegExp('"' + key + '"\\s*:\\s*("(?:[^"\\\\]|\\\\.)*")');
+    const mm = re.exec(text);
+    if (mm) { try { return JSON.parse(mm[1]); } catch { /* ignore */ } }
+    return '';
+  };
+  const items = [];
+  let depth = 0, inStr = false, esc = false, start = -1;
+  for (let i = m.index + m[0].length; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') { if (depth === 0) start = i; depth++; }
+    else if (c === '}') {
+      depth--;
+      if (depth === 0 && start !== -1) { items.push(text.slice(start, i + 1)); start = -1; }
+    } else if (depth === 0 && c === ']') break;
+  }
+  const questions = [];
+  for (const s of items) {
+    try {
+      const o = JSON.parse(s);
+      if (o && typeof o === 'object' && !Array.isArray(o)) questions.push(o);
+    } catch { /* неповний/зіпсований об'єкт — пропускаємо */ }
+  }
+  if (!questions.length) return null;
+  return { title: grabStr('title'), subtitle: grabStr('subtitle'), questions };
+}
+
 function aiStr(v, max = AI_MAX_TEXT) {
   if (v === null || v === undefined) return '';
   return String(v).slice(0, max).trim();
@@ -522,7 +563,7 @@ const AI_QUESTION_SCHEMA = {
   properties: {
     type: { type: 'STRING', enum: ['single', 'multiple', 'short', 'long', 'ordering', 'matching'] },
     prompt: { type: 'STRING' },
-    points: { type: 'INTEGER' },
+    points: { type: 'INTEGER', minimum: 1, maximum: 1000000 },
     options: { type: 'ARRAY', items: { type: 'STRING' } },
     correctIndexes: { type: 'ARRAY', items: { type: 'INTEGER' } },
     acceptedAnswers: { type: 'ARRAY', items: { type: 'STRING' } },
@@ -610,7 +651,7 @@ function aiQuestionSpec({ withExplanations, withModelAnswers }) {
     'Кожне питання — об\'єкт із полями:\n' +
     '- "type": "single" | "multiple" | "short" | "long" | "ordering" | "matching"\n' +
     '- "prompt": текст питання (LaTeX у \\( \\));\n' +
-    '- "points": ціле число балів (зазвичай 1);\n' +
+    '- "points": ціле число балів 1…1000 (зазвичай 1); ніколи не пиши довгі числа чи ланцюжки нулів;\n' +
     '- для "single"/"multiple": "options" — масив РІВНО 4 різних варіантів відповіді, ' +
     '"correctIndexes" — масив індексів правильної відповіді (single: рівно 1, multiple: 2-3);\n' +
     '- для "short": "acceptedAnswers" — масив із 1-3 прийнятних коротких відповідей;\n' +
@@ -633,7 +674,9 @@ function aiQuestionSpec({ withExplanations, withModelAnswers }) {
     '4) Масив питань НІКОЛИ не скорочуй: якщо попросили N — поверни рівно N повних, завершених об\'єктів. ' +
     'Не віддавай частковий результат, не пропускай поля, не замінюй повне питання коротким натяком.\n' +
     '5) Питання "single"/"multiple" БЕЗ масива "options" (рівно 4 елементи) і "correctIndexes" — неприпустиме: ' +
-    'таке питання буде відхилено платформою як некоректне.';
+    'таке питання буде відхилено платформою як некоректне.\n' +
+    '6) Числові поля — тільки малі цілі числа (наприклад "points": 1). Ніколи не генеруй довгі ланцюжки цифр: ' +
+    'така відповідь буде обрізано і відхилено.';
   return s;
 }
 
@@ -751,21 +794,22 @@ function aiBuildSlidesRequest(p) {
   return { systemInstruction: AI_SYSTEM_INSTRUCTION, userMessage: msg, schema: AI_SLIDES_SCHEMA };
 }
 
-// Коригувальний запит: показуємо моделі її ж невдалу відповідь і причини відсіву,
-// просимо виправити. Використовується ОДИН раз, коли жодне питання не пройшло фільтр.
-function aiBuildCorrectiveRequest(request, prevRaw, rejected) {
+// Коригувальний запит: показуємо моделі її ж невдалу відповідь і причину,
+// просимо виправити. Використовується ОДИН раз на запит.
+// feedback — український опис причини (відсів питань або зіпсований JSON).
+function aiBuildCorrectiveRequest(request, prevRaw, feedback) {
   const count = (request.meta && request.meta.count) || AI_MAX_QUESTIONS;
-  const reasons = aiRejectionSummary(rejected) || 'невідомі причини';
   const snippet = prevRaw.length > 6000
     ? prevRaw.slice(0, 4500) + '\n…[середину обрізано]…\n' + prevRaw.slice(-1200)
     : prevRaw;
 
   const msg =
     `Твоя попередня відповідь була відхилена платформою. Виправ її і поверни повний JSON за тією ж схемою.\n\n` +
-    `Причини відсіву: ${reasons}.\n` +
+    `Причина: ${feedback || 'невідомі причини'}.\n` +
     `Потрібно: рівно ${count} ${aiPlural(count, 'питанням', 'питаннями', 'питаннями')} у масиві "questions", ` +
     `кожне питання — повне та валідне.\n` +
     `Для "single"/"multiple": обов'язково "options" (рівно 4 елементи) і "correctIndexes" (індекси з 0).\n` +
+    `Числові поля (наприклад "points") — тільки малі цілі числа 1…1000; ніколи не пиши довгі ланцюжки цифр.\n` +
     `Не скорочуй відповідь, не пропускай поля, не пиши нічого поза JSON.\n\n` +
     `Завдання (твоє попереднє повідомлення, для контексту):\n${request.userMessage.slice(0, 1500)}\n\n` +
     `Попередня відповідь (невалідна):\n${snippet}`;
@@ -1009,10 +1053,53 @@ async function handleAiRequest(req, res) {
     return send(e.code || 502, { ok: false, error: msg });
   }
 
+  const wantsQuestions = action === 'generate_questions' || action === 'generate_full_test';
+
+  // Коригувальний повтор: ОДИН раз на запит — або при зіпсованому/обрізаному JSON,
+  // або коли жодне питання не пройшло фільтр. Показуємо моделі її ж відповідь + причину.
+  let correctiveTried = false;
+  const tryCorrective = async (feedback) => {
+    if (correctiveTried || !wantsQuestions || !AI_CORRECTIVE_RETRY) return null;
+    correctiveTried = true;
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs < AI_CORRECTIVE_MIN_MS) {
+      console.log(`[AI] ${action} corrective retry skipped: deadline (${remainingMs}ms left)`);
+      return null;
+    }
+    console.log(`[AI] ${action} corrective retry: ${feedback}, budget=${remainingMs}ms`);
+    try {
+      const fixRaw = await aiGenerate(
+        aiBuildCorrectiveRequest(request, raw, feedback),
+        { action, apiKey, deadlineMs: remainingMs }
+      );
+      const fixParsed = aiParseJsonLoose(fixRaw);
+      if (!fixParsed) {
+        console.log(`[AI] ${action} corrective retry did not help: parse failed`);
+        return null;
+      }
+      return fixParsed;
+    } catch (e) {
+      console.log(`[AI] ${action} corrective retry failed: ${e.message}`);
+      return null;
+    }
+  };
+
   let parsed = aiParseJsonLoose(raw);
+  if (!parsed && wantsQuestions) {
+    // Обрізана відповідь (дегенеративне число в "points", ліміт токенів) →
+    // відновлюємо принаймні повні питання з масиву.
+    const salv = aiSalvageQuestions(raw);
+    if (salv) {
+      parsed = salv;
+      console.log(`[AI] ${action} salvage: відновлено ${salv.questions.length} повних питань із обрізаного JSON`);
+    }
+  }
   if (!parsed) {
     console.log(`[AI] ${action}: JSON parse failed, raw length=${raw.length} head=${JSON.stringify(raw.slice(0, 200))} tail=${JSON.stringify(raw.slice(-120))}`);
-    return send(502, { ok: false, error: 'AI повернув некоректну відповідь. Спробуйте ще раз.' });
+    parsed = await tryCorrective('відповідь обрізано або зіпсовано (наприклад, дегенеративне число в "points")');
+    if (!parsed) {
+      return send(502, { ok: false, error: 'AI повернув некоректну відповідь. Спробуйте ще раз.' });
+    }
   }
   aiDebug('parsed keys', JSON.stringify(Object.keys(parsed)),
     Array.isArray(parsed.questions) ? `questions=${parsed.questions.length}` : '',
@@ -1022,34 +1109,22 @@ async function handleAiRequest(req, res) {
   // 5) Валідація результату.
   let result;
   try {
-    if (action === 'generate_questions' || action === 'generate_full_test') {
+    if (wantsQuestions) {
       let v = aiValidateQuestions(parsed, request.meta);
 
-      // Коригувальний повтор: жодне питання не пройшло фільтр → показуємо моделі
-      // її ж відповідь + причини відсіву і просимо виправити (один раз, у межах дедлайну).
-      if (!v.questions.length && AI_CORRECTIVE_RETRY) {
-        const remainingMs = deadlineAt - Date.now();
-        if (remainingMs >= AI_CORRECTIVE_MIN_MS) {
-          console.log(`[AI] ${action} corrective retry: kept=0/${v.rawCount} (${aiRejectionSummary(v.rejected)}), budget=${remainingMs}ms`);
-          try {
-            const fixRaw = await aiGenerate(
-              aiBuildCorrectiveRequest(request, raw, v.rejected),
-              { action, apiKey, deadlineMs: remainingMs }
-            );
-            const fixParsed = aiParseJsonLoose(fixRaw);
-            const v2 = fixParsed ? aiValidateQuestions(fixParsed, request.meta) : null;
-            if (v2 && v2.questions.length) {
-              v = v2;
-              parsed = fixParsed;
-              console.log(`[AI] ${action} corrective retry ok: kept=${v2.questions.length}/${v2.rawCount}`);
-            } else {
-              console.log(`[AI] ${action} corrective retry did not help: ${v2 ? `kept=0/${v2.rawCount} rejected=${JSON.stringify(v2.rejected)}` : 'parse failed'}`);
-            }
-          } catch (e) {
-            console.log(`[AI] ${action} corrective retry failed: ${e.message}`);
+      // Коригувальний повтор: жодне питання не пройшло фільтр → виправлення з фідбеком.
+      if (!v.questions.length) {
+        console.log(`[AI] ${action} corrective needed: kept=0/${v.rawCount} (${aiRejectionSummary(v.rejected)})`);
+        const fixParsed = await tryCorrective(`питання не пройшли фільтр: ${aiRejectionSummary(v.rejected)}`);
+        if (fixParsed) {
+          const v2 = aiValidateQuestions(fixParsed, request.meta);
+          if (v2.questions.length) {
+            v = v2;
+            parsed = fixParsed;
+            console.log(`[AI] ${action} corrective retry ok: kept=${v2.questions.length}/${v2.rawCount}`);
+          } else {
+            console.log(`[AI] ${action} corrective retry did not help: kept=0/${v2.rawCount} rejected=${JSON.stringify(v2.rejected)}`);
           }
-        } else {
-          console.log(`[AI] ${action} corrective retry skipped: deadline (${remainingMs}ms left)`);
         }
       }
 
