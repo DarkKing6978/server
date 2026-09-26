@@ -115,6 +115,14 @@ const GEMINI_API_BASE = (process.env.GEMINI_API_BASE || 'https://generativelangu
 const GEMINI_MAX_OUTPUT_TOKENS = parseInt(process.env.GEMINI_MAX_OUTPUT_TOKENS, 10) || 16384;
 const GEMINI_THINKING_LEVEL = (process.env.GEMINI_THINKING_LEVEL || '').toLowerCase();
 
+// Повні AI-логи: AI_DEBUG=1|true|yes|on у середовищі Render (Env → AI Debug).
+// Увімкнення друкує промпти, схеми, сирі відповіді, таймінги та параметри запитів.
+const AI_DEBUG = /^(1|true|yes|on)$/i.test(String(process.env.AI_DEBUG || '').trim());
+function aiDebug(...args) {
+  if (AI_DEBUG) console.log('[AI:debug]', ...args);
+}
+if (AI_DEBUG) console.log('[AI] verbose logging enabled (AI_DEBUG=1)');
+
 const AI_BODY_LIMIT = 300 * 1024;
 const AI_TIMEOUT_MS = 60000;                 // таймаут ОДНІЄЇ спроби
 const AI_DEADLINE_MS = 140000;               // дедлайн на весь запит (генерація)
@@ -127,6 +135,11 @@ const AI_RATE_MAX_OWN = parseInt(process.env.AI_RATE_MAX_OWN, 10) || 300;
 const AI_MAX_QUESTIONS = 40;
 const AI_MAX_SLIDES = 30;
 const AI_MAX_TEXT = 6000;
+// Коригувальний повтор: якщо жодне питання не пройшло фільтр — один повтор із
+// фідбеком (сиря відповідь + причини відсіву). Вимикається: AI_CORRECTIVE_RETRY=0.
+const AI_CORRECTIVE_RETRY = !/^(0|false|no|off)$/i.test(String(process.env.AI_CORRECTIVE_RETRY || '').trim());
+// Мінімальний залишок дедлайну, щоб взятися за коригувальний повтор.
+const AI_CORRECTIVE_MIN_MS = 20000;
 
 const AI_ACTIONS = new Set([
   'generate_questions',   // лише питання (в редактор тесту)
@@ -276,6 +289,44 @@ function aiOverloadMessage(msg) {
     || m.includes('resource_exhausted') || m.includes('unavailable') || m.includes('service unavailable');
 }
 
+// Дружні повідомлення для «постійних» помилок доступу: невалідний ключ,
+// немає прав на модель, модель не існує. Текст Google додається наприкінці,
+// щоб нічого не втратити. Повертає null, якщо це не випадок доступу.
+function aiAccessError(status, gcode, rawMsg, model) {
+  const g = String(gcode || '').toUpperCase();
+  const raw = String(rawMsg || '');
+  const low = raw.toLowerCase();
+
+  const invalidKey =
+    status === 401 ||
+    g === 'UNAUTHENTICATED' ||
+    g === 'API_KEY_INVALID' ||
+    low.includes('api key not valid') ||
+    low.includes('api_key_invalid') ||
+    low.includes('api key not valid.');
+
+  if (invalidKey) {
+    return `Ключ Gemini невалідний або відкликаний: перевірте ключ. Google: ${raw}`;
+  }
+
+  const badModel =
+    status === 404 ||
+    g === 'NOT_FOUND' ||
+    g === 'MODEL_NOT_FOUND' ||
+    (low.includes('model') && (low.includes('not found') || low.includes('unknown model')));
+
+  if (badModel) {
+    return `AI-модель "${model}" недоступна або не існує: перевірте змінну GEMINI_MODEL у Render. Google: ${raw}`;
+  }
+
+  const noAccess = status === 403 || g === 'PERMISSION_DENIED' || g === 'FORBIDDEN';
+  if (noAccess) {
+    return `Немає доступу до AI-моделі для цього ключа (модель недозволена або API Generative Language вимкнено): перевірте права ключа. Google: ${raw}`;
+  }
+
+  return null;
+}
+
 // Один виклик Gemini. Кидає помилку з .status / .retryable / .code.
 // opts.apiKey — ключ конкретного запиту (власний ключ вчителя або платформенний).
 async function aiGenerateOnce({ systemInstruction, userMessage, schema }, { action, deadlineAt, apiKey }) {
@@ -299,6 +350,16 @@ async function aiGenerateOnce({ systemInstruction, userMessage, schema }, { acti
   const remaining = deadlineAt ? deadlineAt - Date.now() : AI_TIMEOUT_MS;
   const timeoutMs = Math.max(5000, Math.min(AI_TIMEOUT_MS, remaining));
   const started = Date.now();
+
+  aiDebug('POST', {
+    model: GEMINI_MODEL,
+    url,
+    timeoutMs,
+    maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS,
+    thinking: generationConfig.thinkingLevel || 'default',
+    systemLen: systemInstruction.length,
+    userLen: userMessage.length,
+  });
 
   let res;
   try {
@@ -333,15 +394,21 @@ async function aiGenerateOnce({ systemInstruction, userMessage, schema }, { acti
   if (!res.ok) {
     const msg = (data && data.error && data.error.message) ? data.error.message : `HTTP ${res.status}`;
     const gcode = (data && data.error && data.error.status) || '';
-    const err = new Error(`Gemini API: ${msg}`);
+    const friendly = aiAccessError(res.status, gcode, msg, GEMINI_MODEL);
+    const err = new Error(friendly || `Gemini API: ${msg}`);
     err.status = res.status;
     err.code = res.status === 429 ? 429 : 502;
     err.retryable = aiRetryableStatus(res.status);
     err.googleCode = gcode;
+    if (friendly) {
+      err.retryable = false;   // невалідний ключ / немає доступу / немає моделі — повтори безглузді
+      err.accessIssue = true;
+    }
     const retryAfter = parseInt(res.headers.get('retry-after') || '', 10);
     if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfterMs = Math.min(retryAfter, 30) * 1000;
 
     console.log(`[AI] ${action} http ${res.status}${gcode ? ' ' + gcode : ''} ${usageStr} ${Date.now() - started}ms: ${msg}`);
+    if (friendly) aiDebug('access issue →', friendly);
     throw err;
   }
 
@@ -358,6 +425,8 @@ async function aiGenerateOnce({ systemInstruction, userMessage, schema }, { acti
   }
 
   console.log(`[AI] ${action} ok finish=${finish || '-'} ${usageStr} out=${Buffer.byteLength(out, 'utf8')}B ${Date.now() - started}ms`);
+  aiDebug('raw head', JSON.stringify(out.slice(0, 500)));
+  aiDebug('raw tail', JSON.stringify(out.slice(-300)));
   return out;
 }
 
@@ -375,6 +444,7 @@ async function aiGenerate(request, opts = {}) {
   }
 
   const deadlineAt = Date.now() + deadlineMs;
+  aiDebug('generate', { action, deadlineMs, key: apiKey ? 'set' : 'none' });
   let lastErr = null;
   let stoppedByDeadline = false;
 
@@ -559,7 +629,11 @@ function aiQuestionSpec({ withExplanations, withModelAnswers }) {
     'short → "acceptedAnswers", ordering → "correctOrder", matching → "pairs". ' +
     'Якщо не можеш вказати правильну відповідь — не генеруй це питання, а візьми інше.\n' +
     '3) Варіанти відповідей мають бути правдоподібними (один явно правильний, решта — типові помилки), ' +
-    'без \'усі з вищевказаних\'.';
+    'без \'усі з вищевказаних\'.\n' +
+    '4) Масив питань НІКОЛИ не скорочуй: якщо попросили N — поверни рівно N повних, завершених об\'єктів. ' +
+    'Не віддавай частковий результат, не пропускай поля, не замінюй повне питання коротким натяком.\n' +
+    '5) Питання "single"/"multiple" БЕЗ масива "options" (рівно 4 елементи) і "correctIndexes" — неприпустиме: ' +
+    'таке питання буде відхилено платформою як некоректне.';
   return s;
 }
 
@@ -588,6 +662,10 @@ function aiBuildQuestionsRequest(p, { fullTest }) {
     msg += `\nЦе повний тест. Додай поле "title" (заголовок тесту), "subtitle" і "topics" (2-4 короткі теми). ` +
       `Час та античит-налаштування задає вчитель окремо — їх не повертай.`;
   }
+
+  msg += `\n\nПоверни ОДИН JSON: ${fullTest ? '{"title", "subtitle", "topics", "questions": [...]} ' : '{"questions": [...]} '}` +
+    `з рівно ${count} ${aiPlural(count, 'питанням', 'питаннями', 'питаннями')} у масиві "questions". ` +
+    `Кожне питання — повне (з усіма обов\'язковими полями свого типу), жодних скорочень.`;
 
   return {
     systemInstruction: AI_SYSTEM_INSTRUCTION,
@@ -671,6 +749,28 @@ function aiBuildSlidesRequest(p) {
     `посилання на зовнішні ресурси чи HTML-теги. Перший слайд — вступний, останній — підсумок/висновки.`;
 
   return { systemInstruction: AI_SYSTEM_INSTRUCTION, userMessage: msg, schema: AI_SLIDES_SCHEMA };
+}
+
+// Коригувальний запит: показуємо моделі її ж невдалу відповідь і причини відсіву,
+// просимо виправити. Використовується ОДИН раз, коли жодне питання не пройшло фільтр.
+function aiBuildCorrectiveRequest(request, prevRaw, rejected) {
+  const count = (request.meta && request.meta.count) || AI_MAX_QUESTIONS;
+  const reasons = aiRejectionSummary(rejected) || 'невідомі причини';
+  const snippet = prevRaw.length > 6000
+    ? prevRaw.slice(0, 4500) + '\n…[середину обрізано]…\n' + prevRaw.slice(-1200)
+    : prevRaw;
+
+  const msg =
+    `Твоя попередня відповідь була відхилена платформою. Виправ її і поверни повний JSON за тією ж схемою.\n\n` +
+    `Причини відсіву: ${reasons}.\n` +
+    `Потрібно: рівно ${count} ${aiPlural(count, 'питанням', 'питаннями', 'питаннями')} у масиві "questions", ` +
+    `кожне питання — повне та валідне.\n` +
+    `Для "single"/"multiple": обов'язково "options" (рівно 4 елементи) і "correctIndexes" (індекси з 0).\n` +
+    `Не скорочуй відповідь, не пропускай поля, не пиши нічого поза JSON.\n\n` +
+    `Завдання (твоє попереднє повідомлення, для контексту):\n${request.userMessage.slice(0, 1500)}\n\n` +
+    `Попередня відповідь (невалідна):\n${snippet}`;
+
+  return { systemInstruction: request.systemInstruction, userMessage: msg, schema: request.schema, meta: request.meta };
 }
 
 // ── AI: валідація результату від моделі ─────────────────────────────────────
@@ -827,6 +927,11 @@ async function handleAiRequest(req, res) {
 
   const action = payload && payload.action;
   if (!AI_ACTIONS.has(action)) return send(400, { ok: false, error: 'Невідома дія' });
+  aiDebug('POST /ai', {
+    action,
+    bodyBytes: bodyText.length,
+    params: JSON.stringify(payload.params || {}).slice(0, 500),
+  });
 
   // 1) Автентифікація + роль (перевірка через PHP me.php).
   let user = null;
@@ -855,6 +960,13 @@ async function handleAiRequest(req, res) {
   }
 
   const rl = aiRateCheck(user.id, ownKey ? AI_RATE_MAX_OWN : AI_RATE_MAX);
+  aiDebug('user', {
+    id: user.id,
+    role,
+    keySource,
+    rateLimit: ownKey ? AI_RATE_MAX_OWN : AI_RATE_MAX,
+    rateOk: rl.ok,
+  });
   if (!rl.ok) {
     const mins = Math.max(1, Math.ceil((rl.resetAt - Date.now()) / 60000));
     return send(429, { ok: false, error: `Забагато AI-запитів. Спробуйте за ${mins} хв.` });
@@ -872,33 +984,75 @@ async function handleAiRequest(req, res) {
   } catch (e) {
     return send(e.code || 400, { ok: false, error: e.message || 'Некоректні параметри' });
   }
+  aiDebug('prompt head', JSON.stringify(request.userMessage.slice(0, 600)));
+  aiDebug('schema', Object.keys((request.schema && request.schema.properties) || {}), 'meta', JSON.stringify(request.meta || {}));
 
   // 4) Виклик Gemini.
   const started = Date.now();
+  const deadlineMs = action === 'grade_answer' ? AI_DEADLINE_GRADE_MS : AI_DEADLINE_MS;
+  const deadlineAt = started + deadlineMs;   // дедлайн на весь запит (враховує коригувальний повтор)
   console.log(`[AI] ${action} for ${user.id} (${role}) key=${keySource}`);
   let raw;
   try {
     raw = await aiGenerate(request, {
       action,
       apiKey,
-      deadlineMs: action === 'grade_answer' ? AI_DEADLINE_GRADE_MS : AI_DEADLINE_MS,
+      deadlineMs,
     });
   } catch (e) {
-    console.error(`[AI] ${action} failed after ${Date.now() - started}ms:`, e.message);
-    return send(e.code || 502, { ok: false, error: e.message || 'AI недоступний' });
+    let msg = e.message || 'AI недоступний';
+    if (e.accessIssue) {
+      // Підказка, ЯКИЙ ключ використано — щоб знати, де саме лікувати.
+      msg += ` [ключ: ${keySource === 'own' ? 'ваш, із профілю' : 'платформний GEMINI_API_KEY'}]`;
+    }
+    console.error(`[AI] ${action} failed after ${Date.now() - started}ms:`, msg);
+    return send(e.code || 502, { ok: false, error: msg });
   }
 
-  const parsed = aiParseJsonLoose(raw);
+  let parsed = aiParseJsonLoose(raw);
   if (!parsed) {
     console.log(`[AI] ${action}: JSON parse failed, raw length=${raw.length} head=${JSON.stringify(raw.slice(0, 200))} tail=${JSON.stringify(raw.slice(-120))}`);
     return send(502, { ok: false, error: 'AI повернув некоректну відповідь. Спробуйте ще раз.' });
   }
+  aiDebug('parsed keys', JSON.stringify(Object.keys(parsed)),
+    Array.isArray(parsed.questions) ? `questions=${parsed.questions.length}` : '',
+    Array.isArray(parsed.slides) ? `slides=${parsed.slides.length}` : '',
+    Array.isArray(parsed.explanations) ? `explanations=${parsed.explanations.length}` : '');
 
   // 5) Валідація результату.
   let result;
   try {
     if (action === 'generate_questions' || action === 'generate_full_test') {
-      const v = aiValidateQuestions(parsed, request.meta);
+      let v = aiValidateQuestions(parsed, request.meta);
+
+      // Коригувальний повтор: жодне питання не пройшло фільтр → показуємо моделі
+      // її ж відповідь + причини відсіву і просимо виправити (один раз, у межах дедлайну).
+      if (!v.questions.length && AI_CORRECTIVE_RETRY) {
+        const remainingMs = deadlineAt - Date.now();
+        if (remainingMs >= AI_CORRECTIVE_MIN_MS) {
+          console.log(`[AI] ${action} corrective retry: kept=0/${v.rawCount} (${aiRejectionSummary(v.rejected)}), budget=${remainingMs}ms`);
+          try {
+            const fixRaw = await aiGenerate(
+              aiBuildCorrectiveRequest(request, raw, v.rejected),
+              { action, apiKey, deadlineMs: remainingMs }
+            );
+            const fixParsed = aiParseJsonLoose(fixRaw);
+            const v2 = fixParsed ? aiValidateQuestions(fixParsed, request.meta) : null;
+            if (v2 && v2.questions.length) {
+              v = v2;
+              parsed = fixParsed;
+              console.log(`[AI] ${action} corrective retry ok: kept=${v2.questions.length}/${v2.rawCount}`);
+            } else {
+              console.log(`[AI] ${action} corrective retry did not help: ${v2 ? `kept=0/${v2.rawCount} rejected=${JSON.stringify(v2.rejected)}` : 'parse failed'}`);
+            }
+          } catch (e) {
+            console.log(`[AI] ${action} corrective retry failed: ${e.message}`);
+          }
+        } else {
+          console.log(`[AI] ${action} corrective retry skipped: deadline (${remainingMs}ms left)`);
+        }
+      }
+
       if (!v.questions.length) {
         const detail = v.rawCount
           ? `AI повернув ${v.rawCount} ${aiPlural(v.rawCount, 'запитання', 'запитання', 'запитань')}, жодне не пройшло фільтр (${aiRejectionSummary(v.rejected)})`
